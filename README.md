@@ -54,11 +54,11 @@ jobs:
           title: "dagger check"
 ```
 
-The `finish` step links the trace two ways: a line on the run's **job summary**
-page (every run) and, on pull requests, a PR comment it updates in place.
-Download it — it's a single `dagger-trace.html`, **not** a zip (uploaded with
-`archive: false`) — and GitHub serves it `text/html` + `inline`, so it renders
-directly in the browser.
+The `finish` step links the trace two ways: on the run's **job summary** page
+(every run) and, on pull requests, in a PR comment it updates in place. The
+link opens the trace straight in your browser — the artifact is a single
+uncompressed HTML (`archive: false`) that GitHub serves `text/html` + `inline`,
+so there's no download or unzip step.
 
 ## Inputs
 

@@ -77,27 +77,18 @@ runs:
       with:
         github-token: ${{ inputs.github-token }}
         script: |
-          const marker = '<!-- dagger-trace-viewer -->';
           const url = process.env.ARTIFACT_URL;
-          const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
-          const sha = (process.env.GITHUB_SHA || '').slice(0, 10);
-          const attempt = process.env.GITHUB_RUN_ATTEMPT || '1';
-          const linkLine =
-            `**[Download the trace viewer](${url})** — a single self-contained HTML file ` +
-            `(no zip); open it in a browser for the span waterfall and per-step output.`;
+          // Pure markdown (no HTML) so GitHub renders it in both the job
+          // summary and the PR comment.
+          const line = `### 📊 [View the Dagger trace](${url})`;
 
-          // Job summary — appears on the run's Summary page for every run.
-          await core.summary
-            .addHeading('📊 Dagger trace', 3)
-            .addRaw(linkLine, true)
-            .addRaw(`\n\ncommit ${sha} · attempt ${attempt}`, true)
-            .write();
+          // Job summary — shown on the run's Summary page for every run.
+          await core.summary.addRaw(line + '\n').write();
 
-          // PR comment — upsert on pull_request events when enabled.
+          // PR comment — upsert a single marker-keyed comment (PRs only).
           if (process.env.WANT_COMMENT === 'true' && context.eventName === 'pull_request') {
-            const body =
-              `${marker}\n### 📊 Dagger trace\n\n${linkLine}\n\n` +
-              `Run: [${runUrl} (attempt ${attempt})](${runUrl}) · commit ${sha}\n`;
+            const marker = '<!-- dagger-trace-viewer -->';
+            const body = `${marker}\n${line}\n`;
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
             const comments = await github.paginate(github.rest.issues.listComments, {
