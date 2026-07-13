@@ -1,0 +1,98 @@
+name: "Publish Dagger trace"
+description: >
+  Stop the collector, bundle the captured telemetry into a single
+  self-contained HTML viewer, upload it as a non-zipped artifact (opens
+  directly in the browser), and optionally upsert a PR comment linking it.
+  Pair with the `start` action. Run with `if: always()` so the trace is
+  produced even when the checks failed.
+
+inputs:
+  data-dir:
+    description: "Directory the collector wrote to (must match the start action). Defaults to $RUNNER_TEMP/dagger-otel."
+    required: false
+    default: ""
+  title:
+    description: "Title shown in the viewer header."
+    required: false
+    default: "dagger trace"
+  artifact-name:
+    description: "Artifact name and downloaded file name (should end in .html)."
+    required: false
+    default: "dagger-trace.html"
+  retention-days:
+    description: "Artifact retention in days."
+    required: false
+    default: "14"
+  comment:
+    description: "Upsert a PR comment linking the trace (only on pull_request events)."
+    required: false
+    default: "true"
+  github-token:
+    description: "Token used to upsert the PR comment; needs pull-requests: write."
+    required: false
+    default: ${{ github.token }}
+
+outputs:
+  artifact-url:
+    description: "Download URL of the uploaded trace artifact (requires GitHub auth)."
+    value: ${{ steps.upload.outputs.artifact-url }}
+
+runs:
+  using: composite
+  steps:
+    - id: bundle
+      shell: bash
+      run: |
+        data_dir="${{ inputs.data-dir }}"
+        data_dir="${data_dir:-$RUNNER_TEMP/dagger-otel}"
+        out="$RUNNER_TEMP/${{ inputs.artifact-name }}"
+        jq -n \
+          --arg title "${{ inputs.title }}" \
+          --arg repo "$GITHUB_REPOSITORY" \
+          --arg ref "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" \
+          --arg sha "$GITHUB_SHA" \
+          --arg date "$(date -u +%FT%TZ)" \
+          --arg runUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+          '$ARGS.named' > "$data_dir/meta.json"
+        "$GITHUB_ACTION_PATH/../scripts/finish.sh" "$data_dir" "$out" "$data_dir/meta.json"
+        echo "output=$out" >> "$GITHUB_OUTPUT"
+
+    # archive: false uploads the single HTML as-is (no zip); the download is the
+    # file itself, served text/html + inline so it renders in the browser.
+    - id: upload
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        path: ${{ steps.bundle.outputs.output }}
+        archive: false
+        overwrite: true
+        retention-days: ${{ inputs.retention-days }}
+
+    # Upsert a single PR comment (keyed by the marker) linking the artifact.
+    - if: ${{ inputs.comment == 'true' && github.event_name == 'pull_request' && steps.upload.outputs.artifact-url }}
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+      with:
+        github-token: ${{ inputs.github-token }}
+        script: |
+          const marker = '<!-- dagger-trace-viewer -->';
+          const url = process.env.ARTIFACT_URL;
+          const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
+          const sha = (process.env.GITHUB_SHA || '').slice(0, 10);
+          const attempt = process.env.GITHUB_RUN_ATTEMPT || '1';
+          const body =
+            `${marker}\n### 📊 Dagger trace\n\n` +
+            `**[Download the trace viewer](${url})** — a single self-contained HTML file ` +
+            `(no zip); open it in a browser for the span waterfall and per-step output.\n\n` +
+            `Run: [${runUrl} (attempt ${attempt})](${runUrl}) · commit ${sha}\n`;
+          const { owner, repo } = context.repo;
+          const issue_number = context.issue.number;
+          const comments = await github.paginate(github.rest.issues.listComments, {
+            owner, repo, issue_number, per_page: 100,
+          });
+          const existing = comments.find((c) => c.body && c.body.startsWith(marker));
+          if (existing) {
+            await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+          } else {
+            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+          }

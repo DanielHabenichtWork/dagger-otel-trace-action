@@ -1,0 +1,33 @@
+# OTLP receiver -> file exporter, used to capture Dagger's OpenTelemetry
+# stream (spans + per-exec stdout/stderr log records) during CI runs.
+# Output is OTLP/JSON, one batch per line (traces.jsonl / logs.jsonl).
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  file/traces:
+    path: /data/traces.jsonl
+  file/logs:
+    path: /data/logs.jsonl
+  file/metrics:
+    path: /data/metrics.jsonl
+
+service:
+  telemetry:
+    logs:
+      level: warn
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [file/traces]
+    logs:
+      receivers: [otlp]
+      exporters: [file/logs]
+    metrics:
+      receivers: [otlp]
+      exporters: [file/metrics]

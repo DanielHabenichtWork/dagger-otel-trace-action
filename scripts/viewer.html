@@ -1,0 +1,541 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Dagger Trace Viewer</title>
+<style>
+  :root {
+    --bg: #0d1117; --bg2: #161b22; --bg3: #1f2630; --fg: #e6edf3; --fg-dim: #8b949e;
+    --border: #30363d; --accent: #58a6ff; --ok: #3fb950; --err: #f85149; --warn: #d29922;
+    --cached: #388bfd; --bar: #2f81f7; --bar-err: #f85149; --bar-cached: #1f4c8f;
+    --mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body { margin: 0; background: var(--bg); color: var(--fg); font: 13px/1.45 -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; display: flex; flex-direction: column; }
+  header { padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--bg2); display: flex; flex-wrap: wrap; gap: 4px 24px; align-items: baseline; }
+  header h1 { font-size: 15px; margin: 0; }
+  header .meta { color: var(--fg-dim); font-size: 12px; }
+  header .meta a { color: var(--accent); text-decoration: none; }
+
+  #summary { padding: 8px 16px; border-bottom: 1px solid var(--border); background: var(--bg2); display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; }
+  .chip { border: 1px solid var(--border); border-radius: 12px; padding: 1px 10px; cursor: pointer; background: var(--bg3); }
+  .chip.ok { color: var(--ok); border-color: #2ea04366; }
+  .chip.err { color: var(--err); border-color: #f8514966; }
+  .chip.plain { cursor: default; color: var(--fg-dim); }
+
+  #toolbar { padding: 6px 16px; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; background: var(--bg); }
+  #toolbar input[type=search] { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; width: 260px; }
+  #toolbar label { color: var(--fg-dim); user-select: none; cursor: pointer; white-space: nowrap; }
+  #toolbar button { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 10px; cursor: pointer; }
+  #toolbar button:hover { border-color: var(--accent); }
+  #matchcount { color: var(--fg-dim); font-size: 12px; }
+
+  #content { flex: 1; display: flex; min-height: 0; }
+  #tree { flex: 1; overflow: auto; min-width: 0; }
+  #rows { position: relative; padding-bottom: 40px; }
+
+  .row { display: flex; align-items: center; height: 22px; cursor: pointer; white-space: nowrap; }
+  .row:hover { background: #1c2431; }
+  .row.selected { background: #1f3a5f; }
+  .row.dimmed { opacity: 0.35; }
+  .row .twisty { width: 16px; flex: none; text-align: center; color: var(--fg-dim); font-size: 10px; }
+  .row .name { overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); font-size: 12px; }
+  .row.err .name { color: var(--err); }
+  .row.cached .name { color: var(--fg-dim); }
+  .badge { flex: none; font-size: 9px; font-weight: 600; border-radius: 4px; padding: 0 5px; margin-left: 6px; letter-spacing: .5px; }
+  .badge.cached { color: var(--cached); border: 1px solid #388bfd55; }
+  .badge.error { color: #fff; background: var(--err); }
+  .badge.errdeep { color: var(--err); border: 1px solid #f8514955; }
+  .badge.logs { color: var(--fg-dim); border: 1px solid var(--border); }
+  .badge.check-ok { color: var(--ok); border: 1px solid #2ea04366; }
+  .badge.check-fail { color: #fff; background: var(--err); }
+  .row .spacer { flex: 1; min-width: 24px; }
+  .row .dur { flex: none; color: var(--fg-dim); font-family: var(--mono); font-size: 11px; width: 70px; text-align: right; padding-right: 8px; }
+  .row .track { flex: none; width: 30%; height: 12px; position: relative; background: #11151c; border-left: 1px solid var(--border); }
+  .row .bar { position: absolute; top: 2px; height: 8px; border-radius: 2px; background: var(--bar); min-width: 2px; }
+  .row.err .bar { background: var(--bar-err); }
+  .row.cached .bar { background: var(--bar-cached); }
+
+  #detail { width: 44%; max-width: 900px; border-left: 1px solid var(--border); background: var(--bg2); overflow: auto; display: none; flex-direction: column; }
+  #detail.open { display: flex; }
+  #detail .dhead { padding: 10px 14px; border-bottom: 1px solid var(--border); position: sticky; top: 0; background: var(--bg2); }
+  #detail .dhead h2 { margin: 0 24px 4px 0; font-size: 13px; font-family: var(--mono); word-break: break-all; white-space: pre-wrap; }
+  #detail .dhead .sub { color: var(--fg-dim); font-size: 12px; }
+  #detail .close { position: absolute; top: 8px; right: 10px; background: none; border: none; color: var(--fg-dim); font-size: 16px; cursor: pointer; }
+  #detail section { padding: 10px 14px; border-bottom: 1px solid var(--border); }
+  #detail h3 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--fg-dim); }
+  table.attrs { border-collapse: collapse; width: 100%; font-size: 12px; }
+  table.attrs td { padding: 2px 8px 2px 0; vertical-align: top; font-family: var(--mono); word-break: break-all; }
+  table.attrs td:first-child { color: var(--fg-dim); white-space: nowrap; }
+  pre.output { margin: 0; padding: 8px 10px; background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; font: 11.5px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: 60vh; }
+  pre.output .stderr { color: var(--warn); }
+  .statusmsg { color: var(--err); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+
+  /* ANSI colors */
+  .a30{color:#484f58}.a31{color:#ff7b72}.a32{color:#3fb950}.a33{color:#d29922}.a34{color:#58a6ff}.a35{color:#bc8cff}.a36{color:#39c5cf}.a37{color:#b1bac4}
+  .a90{color:#6e7681}.a91{color:#ffa198}.a92{color:#56d364}.a93{color:#e3b341}.a94{color:#79c0ff}.a95{color:#d2a8ff}.a96{color:#56d4dd}.a97{color:#f0f6fc}
+  .ab{font-weight:700}
+
+  #dropzone { flex: 1; display: flex; align-items: center; justify-content: center; flex-direction: column; gap: 12px; color: var(--fg-dim); border: 2px dashed var(--border); margin: 24px; border-radius: 12px; }
+  #dropzone.hover { border-color: var(--accent); color: var(--accent); }
+  #dropzone code { font-family: var(--mono); }
+  #loaderr { color: var(--err); padding: 16px; font-family: var(--mono); white-space: pre-wrap; display: none; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Dagger trace</h1>
+  <span class="meta" id="meta"></span>
+</header>
+<div id="summary" hidden></div>
+<div id="toolbar" hidden>
+  <input type="search" id="search" placeholder="Filter spans by name…">
+  <span id="matchcount"></span>
+  <label><input type="checkbox" id="f-internal"> internal spans</label>
+  <label><input type="checkbox" id="f-encapsulated"> encapsulated spans</label>
+  <label><input type="checkbox" id="f-cached" checked> cached spans</label>
+  <button id="expandall">Expand all</button>
+  <button id="collapseall">Collapse</button>
+</div>
+<div id="content">
+  <div id="tree">
+    <div id="loaderr"></div>
+    <div id="dropzone">
+      <div><strong>Drop OTLP JSONL files here</strong> (traces / logs, plain or .gz)</div>
+      <div>Files are read locally in your browser — nothing is uploaded.</div>
+      <div><code>traces.jsonl</code> and <code>logs.jsonl</code> from the otel-collector file exporter</div>
+      <input type="file" id="fileinput" multiple accept=".jsonl,.json,.gz">
+    </div>
+    <div id="rows"></div>
+  </div>
+  <aside id="detail">
+    <div class="dhead">
+      <button class="close" id="dclose" title="Close">✕</button>
+      <h2 id="dname"></h2>
+      <div class="sub" id="dsub"></div>
+    </div>
+    <div id="dbody"></div>
+  </aside>
+</div>
+
+<!--__DAGGER_TRACE_DATA__-->
+
+<script>
+"use strict";
+/* ---------- decoding helpers ---------- */
+async function gunzipB64(b64) {
+  const bin = atob(b64.replace(/\s+/g, ""));
+  const bytes = Uint8Array.from(bin, c => c.charCodeAt(0));
+  const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return await new Response(stream).text();
+}
+function parseJsonl(text) {
+  const out = [];
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    out.push(JSON.parse(t));
+  }
+  return out;
+}
+function attrVal(v) {
+  if (v == null) return null;
+  if ("stringValue" in v) return v.stringValue;
+  if ("intValue" in v) return Number(v.intValue);
+  if ("boolValue" in v) return v.boolValue;
+  if ("doubleValue" in v) return v.doubleValue;
+  if ("arrayValue" in v) return (v.arrayValue.values || []).map(attrVal);
+  if ("kvlistValue" in v) return Object.fromEntries((v.kvlistValue.values || []).map(kv => [kv.key, attrVal(kv.value)]));
+  return v;
+}
+function attrsToObj(list) {
+  const o = {};
+  for (const a of list || []) o[a.key] = attrVal(a.value);
+  return o;
+}
+
+/* ---------- model ---------- */
+const state = {
+  spans: new Map(),      // spanId -> span
+  roots: [],
+  logsBySpan: new Map(), // spanId -> [logRecord]
+  minStart: Infinity, maxEnd: -Infinity,
+  selected: null,
+  expanded: new Set(),
+  query: "",
+};
+
+function ingestTraces(batches) {
+  for (const batch of batches) {
+    for (const rs of batch.resourceSpans || []) {
+      const res = attrsToObj(rs.resource && rs.resource.attributes);
+      const service = res["service.name"] || "";
+      for (const ss of rs.scopeSpans || []) {
+        const scope = (ss.scope && ss.scope.name) || "";
+        for (const s of ss.spans || []) {
+          const attrs = attrsToObj(s.attributes);
+          const span = {
+            id: s.spanId, parent: s.parentSpanId || null, traceId: s.traceId,
+            name: s.name, service, scope,
+            start: Number(s.startTimeUnixNano) / 1e6, end: Number(s.endTimeUnixNano) / 1e6,
+            statusCode: (s.status && s.status.code) || 0,
+            statusMsg: (s.status && s.status.message) || "",
+            attrs,
+            cached: !!attrs["dagger.io/dag.cached"],
+            internal: !!attrs["dagger.io/ui.internal"],
+            passthrough: !!attrs["dagger.io/ui.passthrough"],
+            encapsulated: !!attrs["dagger.io/ui.encapsulated"],
+            checkName: attrs["dagger.io/check.name"],
+            checkPassed: attrs["dagger.io/check.passed"],
+            children: [],
+          };
+          const prev = state.spans.get(span.id);
+          // live exports can emit a span more than once; keep the most complete record
+          if (prev && prev.end && !span.end) continue;
+          state.spans.set(span.id, span);
+        }
+      }
+    }
+  }
+}
+function ingestLogs(batches) {
+  for (const batch of batches) {
+    for (const rl of batch.resourceLogs || []) {
+      for (const sl of rl.scopeLogs || []) {
+        for (const r of sl.logRecords || []) {
+          if (!r.spanId) continue;
+          const rec = {
+            t: Number(r.timeUnixNano || r.observedTimeUnixNano),
+            body: (r.body && r.body.stringValue) || "",
+            stream: Number((attrsToObj(r.attributes))["stdio.stream"] || 1),
+          };
+          if (!state.logsBySpan.has(r.spanId)) state.logsBySpan.set(r.spanId, []);
+          state.logsBySpan.get(r.spanId).push(rec);
+        }
+      }
+    }
+  }
+  for (const recs of state.logsBySpan.values()) recs.sort((a, b) => a.t - b.t);
+}
+function buildTree() {
+  state.roots = [];
+  for (const span of state.spans.values()) {
+    span.children = [];
+  }
+  for (const span of state.spans.values()) {
+    const parent = span.parent && state.spans.get(span.parent);
+    if (parent) parent.children.push(span);
+    else state.roots.push(span);
+    if (span.start) state.minStart = Math.min(state.minStart, span.start);
+    if (span.end) state.maxEnd = Math.max(state.maxEnd, span.end);
+  }
+  const byStart = (a, b) => a.start - b.start;
+  for (const span of state.spans.values()) span.children.sort(byStart);
+  state.roots.sort(byStart);
+  // deep flags: does subtree contain an error / any logs?
+  // Errors inside internal or encapsulated subtrees are expected noise
+  // (e.g. registry HEAD 404s during image resolution) unless the parent
+  // itself failed, matching how the Dagger TUI surfaces them.
+  const visit = (span, suppressed) => {
+    span.hasLogs = state.logsBySpan.has(span.id);
+    span.errVisible = span.statusCode === 2 && !suppressed;
+    span.errDeep = span.errVisible;
+    span.logsDeep = span.hasLogs;
+    for (const c of span.children) {
+      visit(c, suppressed || c.internal || (c.encapsulated && span.statusCode !== 2));
+      span.errDeep = span.errDeep || c.errDeep;
+      span.logsDeep = span.logsDeep || c.logsDeep;
+    }
+  };
+  state.roots.forEach(r => visit(r, r.internal));
+}
+
+/* ---------- filtering / visible forest ---------- */
+function filters() {
+  return {
+    internal: document.getElementById("f-internal").checked,
+    encapsulated: document.getElementById("f-encapsulated").checked,
+    cached: document.getElementById("f-cached").checked,
+  };
+}
+// Mirrors the Dagger TUI defaults: internal spans hidden, passthrough spans
+// replaced by their children, encapsulated spans shown only when the parent failed.
+function visibleChildren(span, f, parentFailed) {
+  const out = [];
+  for (const c of span ? span.children : state.roots) {
+    if (c.internal && !f.internal) continue;
+    if (c.encapsulated && !f.encapsulated && !parentFailed) continue;
+    if (c.cached && !f.cached) continue;
+    if (c.passthrough) out.push(...visibleChildren(c, f, c.statusCode === 2 || parentFailed));
+    else out.push(c);
+  }
+  return out.sort((a, b) => a.start - b.start);
+}
+
+/* ---------- rendering ---------- */
+const fmtDur = ms => !isFinite(ms) || ms < 0 ? "" : ms < 1 ? ms.toFixed(2) + "ms" : ms < 1000 ? ms.toFixed(1) + "ms" : ms < 60000 ? (ms / 1000).toFixed(2) + "s" : Math.floor(ms / 60000) + "m" + ((ms % 60000) / 1000).toFixed(0) + "s";
+const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function render() {
+  const f = filters();
+  const rows = document.getElementById("rows");
+  rows.textContent = "";
+  const total = state.maxEnd - state.minStart || 1;
+  const q = state.query.toLowerCase();
+  let matches = 0;
+
+  const addRow = (span, depth, parentFailed) => {
+    const kids = visibleChildren(span, f, span.statusCode === 2 || parentFailed);
+    const isMatch = q && span.name.toLowerCase().includes(q);
+    if (isMatch) matches++;
+    const open = state.expanded.has(span.id) || (q && subtreeMatches(span, q));
+    const row = document.createElement("div");
+    row.className = "row" + (span.statusCode === 2 ? " err" : "") + (span.cached ? " cached" : "") + (q && !isMatch ? " dimmed" : "") + (state.selected === span.id ? " selected" : "");
+    row.style.paddingLeft = depth * 16 + 6 + "px";
+    const left = ((span.start - state.minStart) / total * 100).toFixed(3);
+    const width = (Math.max(span.end - span.start, 0) / total * 100).toFixed(3);
+    row.innerHTML =
+      `<span class="twisty">${kids.length ? (open ? "▾" : "▸") : ""}</span>` +
+      `<span class="name">${esc(span.name)}</span>` +
+      (span.checkName ? `<span class="badge ${span.checkPassed === false ? "check-fail" : "check-ok"}">${span.checkPassed === false ? "✗ FAILED" : "✓ CHECK"}</span>` : "") +
+      (span.statusCode === 2 ? `<span class="badge error">ERROR</span>` : span.errDeep ? `<span class="badge errdeep">error inside</span>` : "") +
+      (span.cached ? `<span class="badge cached">CACHED</span>` : "") +
+      (span.hasLogs ? `<span class="badge logs">output</span>` : "") +
+      `<span class="spacer"></span><span class="dur">${fmtDur(span.end - span.start)}</span>` +
+      `<span class="track"><span class="bar" style="left:${left}%;width:${width}%"></span></span>`;
+    row.dataset.id = span.id;
+    row.querySelector(".twisty").addEventListener("click", e => { e.stopPropagation(); toggle(span.id); });
+    row.addEventListener("click", () => select(span.id));
+    rows.appendChild(row);
+    if (open) for (const c of kids) addRow(c, depth + 1, span.statusCode === 2 || parentFailed);
+  };
+  for (const r of visibleChildren(null, f, false)) addRow(r, 0, false);
+  document.getElementById("matchcount").textContent = q ? matches + " match" + (matches === 1 ? "" : "es") : "";
+}
+const matchCache = new Map();
+function subtreeMatches(span, q) {
+  const key = span.id + "\0" + q;
+  if (matchCache.has(key)) return matchCache.get(key);
+  let m = span.children.some(c => c.name.toLowerCase().includes(q) || subtreeMatches(c, q));
+  matchCache.set(key, m);
+  return m;
+}
+function toggle(id) {
+  state.expanded.has(id) ? state.expanded.delete(id) : state.expanded.add(id);
+  render();
+}
+function expandTo(id) {
+  let s = state.spans.get(id);
+  while (s && s.parent) { state.expanded.add(s.parent); s = state.spans.get(s.parent); }
+}
+
+/* ---------- ANSI -> HTML ---------- */
+function ansiToHtml(text) {
+  // handle carriage-return overwrites (progress bars): keep content after last \r per line
+  text = text.split("\n").map(l => l.includes("\r") ? l.slice(l.lastIndexOf("\r") + 1) : l).join("\n");
+  let html = "", cls = [];
+  const flushOpen = () => cls.length ? `<span class="${cls.join(" ")}">` : "";
+  const parts = text.split(/(\x1b\[[0-9;]*m)/);
+  let openTag = false;
+  for (const p of parts) {
+    const m = p.match(/^\x1b\[([0-9;]*)m$/);
+    if (m) {
+      if (openTag) { html += "</span>"; openTag = false; }
+      for (const code of (m[1] || "0").split(";")) {
+        const n = Number(code || 0);
+        if (n === 0) cls = [];
+        else if (n === 1) { if (!cls.includes("ab")) cls.push("ab"); }
+        else if ((n >= 30 && n <= 37) || (n >= 90 && n <= 97)) { cls = cls.filter(c => !/^a\d/.test(c)); cls.push("a" + n); }
+      }
+      if (cls.length) { html += flushOpen(); openTag = true; }
+    } else if (p) {
+      html += esc(p.replace(/\x1b\[[0-9;?]*[A-Za-z]/g, ""));
+    }
+  }
+  if (openTag) html += "</span>";
+  return html;
+}
+
+/* ---------- detail panel ---------- */
+function collectLogs(span, deep) {
+  const recs = [];
+  const visit = s => {
+    for (const r of state.logsBySpan.get(s.id) || []) recs.push(r);
+    if (deep) s.children.forEach(visit);
+  };
+  visit(span);
+  return recs.sort((a, b) => a.t - b.t);
+}
+function renderLogsInto(el, span, deep) {
+  const recs = collectLogs(span, deep);
+  if (!recs.length) { el.innerHTML = '<span style="color:var(--fg-dim)">no output</span>'; return; }
+  el.innerHTML = recs.map(r => `<span class="${r.stream === 2 ? "stderr" : "stdout"}">${ansiToHtml(r.body)}</span>`).join("");
+}
+function select(id) {
+  state.selected = id;
+  const span = state.spans.get(id);
+  const panel = document.getElementById("detail");
+  panel.classList.add("open");
+  document.getElementById("dname").textContent = span.name;
+  const dur = fmtDur(span.end - span.start);
+  document.getElementById("dsub").textContent =
+    `${span.service || "?"} · ${span.scope || "?"} · ${dur}` + (span.cached ? " · CACHED" : "") + (span.statusCode === 2 ? " · ERROR" : "");
+  const body = document.getElementById("dbody");
+  body.textContent = "";
+
+  if (span.statusMsg) {
+    const sec = document.createElement("section");
+    sec.innerHTML = `<h3>Error</h3><div class="statusmsg">${esc(span.statusMsg)}</div>`;
+    body.appendChild(sec);
+  }
+  const logSec = document.createElement("section");
+  logSec.innerHTML = `<h3>Output <label style="font-weight:normal;text-transform:none;letter-spacing:0;margin-left:8px"><input type="checkbox" id="deep-logs" checked> include children</label></h3><pre class="output"></pre>`;
+  body.appendChild(logSec);
+  const pre = logSec.querySelector("pre");
+  const deepBox = logSec.querySelector("#deep-logs");
+  const update = () => renderLogsInto(pre, span, deepBox.checked);
+  deepBox.addEventListener("change", update);
+  update();
+
+  const attrs = Object.entries(span.attrs).filter(([k]) => k !== "dagger.io/dag.call");
+  const timing = document.createElement("section");
+  timing.innerHTML = `<h3>Span</h3><table class="attrs">
+    <tr><td>span / trace</td><td>${span.id} / ${span.traceId}</td></tr>
+    <tr><td>start</td><td>${new Date(span.start).toISOString()}</td></tr>
+    <tr><td>duration</td><td>${dur}</td></tr>
+    ${attrs.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(typeof v === "string" ? v : JSON.stringify(v))}</td></tr>`).join("")}
+  </table>`;
+  body.appendChild(timing);
+  render();
+}
+
+/* ---------- summary ---------- */
+function renderSummary() {
+  const el = document.getElementById("summary");
+  el.hidden = false;
+  const spans = [...state.spans.values()];
+  const checks = spans.filter(s => s.checkName);
+  const errors = spans.filter(s => s.errVisible);
+  const chips = [];
+  chips.push(`<span class="chip plain">${spans.length} spans · ${fmtDur(state.maxEnd - state.minStart)} total</span>`);
+  for (const c of checks.sort((a, b) => a.start - b.start)) {
+    chips.push(`<span class="chip ${c.checkPassed === false ? "err" : "ok"}" data-goto="${c.id}">${c.checkPassed === false ? "✗" : "✓"} ${esc(c.checkName)}</span>`);
+  }
+  if (!checks.length && errors.length) chips.push(`<span class="chip plain">${errors.length} error span(s)</span>`);
+  for (const e of errors.slice(0, 8)) {
+    chips.push(`<span class="chip err" data-goto="${e.id}">⚠ ${esc(e.name.slice(0, 60))}</span>`);
+  }
+  el.innerHTML = chips.join("");
+  el.querySelectorAll("[data-goto]").forEach(chip => chip.addEventListener("click", () => {
+    const id = chip.dataset.goto;
+    expandTo(id);
+    select(id);
+    const row = document.querySelector(`.row[data-id="${id}"]`);
+    if (row) row.scrollIntoView({ block: "center" });
+  }));
+}
+
+/* ---------- boot ---------- */
+function autoDetectIngest(batches) {
+  ingestTraces(batches.filter(b => b.resourceSpans));
+  ingestLogs(batches.filter(b => b.resourceLogs));
+}
+function finishLoad() {
+  buildTree();
+  document.getElementById("dropzone").style.display = "none";
+  document.getElementById("toolbar").hidden = false;
+  // expand the interesting first levels by default
+  const f = filters();
+  for (const r of visibleChildren(null, f, false)) {
+    state.expanded.add(r.id);
+    for (const c of visibleChildren(r, f, false)) state.expanded.add(c.id);
+  }
+  renderSummary();
+  render();
+}
+function loadError(e) {
+  const el = document.getElementById("loaderr");
+  el.style.display = "block";
+  el.textContent = "Failed to load trace data: " + (e && e.message || e);
+}
+
+function applyMeta(m) {
+  document.title = `Dagger trace — ${m.title || ""}`;
+  document.getElementById("meta").innerHTML =
+    [m.repo && esc(m.repo), m.ref && esc(m.ref), m.sha && esc(m.sha.slice(0, 10)), m.date && esc(m.date)].filter(Boolean).join(" · ") +
+    (m.runUrl ? ` · <a href="${esc(m.runUrl)}">workflow run</a>` : "");
+}
+function ingestBatches(batches) {
+  for (const b of batches) if (b.__meta__) applyMeta(b.__meta__);
+  autoDetectIngest(batches);
+}
+async function loadEmbedded() {
+  const metaEl = document.getElementById("data-meta");
+  if (metaEl) {
+    try { applyMeta(JSON.parse(metaEl.textContent)); } catch (e) { /* meta is optional */ }
+  }
+  const tEl = document.getElementById("data-traces");
+  const lEl = document.getElementById("data-logs");
+  if (!tEl) return false;
+  autoDetectIngest(parseJsonl(await gunzipB64(tEl.textContent)));
+  if (lEl) autoDetectIngest(parseJsonl(await gunzipB64(lEl.textContent)));
+  finishLoad();
+  return true;
+}
+
+// Hosted mode: one viewer at the site root fetches a published data file
+// same-origin (?run=<workflow-run-id> -> runs/<id>/data.jsonl.gz, or an
+// explicit ?data=<path>). Sniff the gzip magic instead of trusting the
+// extension: if the server sets Content-Encoding the body arrives already
+// decompressed.
+async function loadRemote() {
+  const q = new URLSearchParams(location.search);
+  const run = q.get("run");
+  const path = q.get("data") || (run ? `runs/${encodeURIComponent(run)}/data.jsonl.gz` : null);
+  if (!path) return false;
+  const res = await fetch(path);
+  if (!res.ok) throw new Error(`fetching ${path}: HTTP ${res.status}`);
+  const buf = new Uint8Array(await res.arrayBuffer());
+  let text;
+  if (buf[0] === 0x1f && buf[1] === 0x8b) {
+    const ds = new Blob([buf]).stream().pipeThrough(new DecompressionStream("gzip"));
+    text = await new Response(ds).text();
+  } else {
+    text = new TextDecoder().decode(buf);
+  }
+  ingestBatches(parseJsonl(text));
+  finishLoad();
+  return true;
+}
+
+async function loadFiles(files) {
+  for (const f of files) {
+    let text;
+    if (f.name.endsWith(".gz")) {
+      const ds = f.stream().pipeThrough(new DecompressionStream("gzip"));
+      text = await new Response(ds).text();
+    } else {
+      text = await f.text();
+    }
+    autoDetectIngest(parseJsonl(text));
+  }
+  finishLoad();
+}
+
+document.getElementById("dclose").addEventListener("click", () => { document.getElementById("detail").classList.remove("open"); state.selected = null; render(); });
+document.getElementById("search").addEventListener("input", e => { state.query = e.target.value.trim(); matchCache.clear(); render(); });
+for (const id of ["f-internal", "f-encapsulated", "f-cached"]) document.getElementById(id).addEventListener("change", render);
+document.getElementById("expandall").addEventListener("click", () => { for (const id of state.spans.keys()) state.expanded.add(id); render(); });
+document.getElementById("collapseall").addEventListener("click", () => { state.expanded.clear(); render(); });
+const dz = document.getElementById("dropzone");
+dz.addEventListener("dragover", e => { e.preventDefault(); dz.classList.add("hover"); });
+dz.addEventListener("dragleave", () => dz.classList.remove("hover"));
+dz.addEventListener("drop", e => { e.preventDefault(); dz.classList.remove("hover"); loadFiles(e.dataTransfer.files).catch(loadError); });
+document.getElementById("fileinput").addEventListener("change", e => loadFiles(e.target.files).catch(loadError));
+
+loadEmbedded().then((ok) => ok || loadRemote()).catch(loadError);
+</script>
+</body>
+</html>
