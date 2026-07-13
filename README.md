@@ -54,7 +54,8 @@ jobs:
           title: "dagger check"
 ```
 
-The `finish` step posts (and updates in place) a PR comment linking the trace.
+The `finish` step links the trace two ways: a line on the run's **job summary**
+page (every run) and, on pull requests, a PR comment it updates in place.
 Download it — it's a single `dagger-trace.html`, **not** a zip (uploaded with
 `archive: false`) — and GitHub serves it `text/html` + `inline`, so it renders
 directly in the browser.

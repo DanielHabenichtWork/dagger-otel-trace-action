@@ -67,11 +67,13 @@ runs:
         overwrite: true
         retention-days: ${{ inputs.retention-days }}
 
-    # Upsert a single PR comment (keyed by the marker) linking the artifact.
-    - if: ${{ inputs.comment == 'true' && github.event_name == 'pull_request' && steps.upload.outputs.artifact-url }}
+    # Link the artifact from the run's job summary (every run), and upsert a
+    # single marker-keyed PR comment (pull_request events only).
+    - if: ${{ steps.upload.outputs.artifact-url }}
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        WANT_COMMENT: ${{ inputs.comment }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
@@ -80,19 +82,31 @@ runs:
           const runUrl = `${process.env.GITHUB_SERVER_URL}/${process.env.GITHUB_REPOSITORY}/actions/runs/${process.env.GITHUB_RUN_ID}`;
           const sha = (process.env.GITHUB_SHA || '').slice(0, 10);
           const attempt = process.env.GITHUB_RUN_ATTEMPT || '1';
-          const body =
-            `${marker}\n### 📊 Dagger trace\n\n` +
+          const linkLine =
             `**[Download the trace viewer](${url})** — a single self-contained HTML file ` +
-            `(no zip); open it in a browser for the span waterfall and per-step output.\n\n` +
-            `Run: [${runUrl} (attempt ${attempt})](${runUrl}) · commit ${sha}\n`;
-          const { owner, repo } = context.repo;
-          const issue_number = context.issue.number;
-          const comments = await github.paginate(github.rest.issues.listComments, {
-            owner, repo, issue_number, per_page: 100,
-          });
-          const existing = comments.find((c) => c.body && c.body.startsWith(marker));
-          if (existing) {
-            await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
-          } else {
-            await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            `(no zip); open it in a browser for the span waterfall and per-step output.`;
+
+          // Job summary — appears on the run's Summary page for every run.
+          await core.summary
+            .addHeading('📊 Dagger trace', 3)
+            .addRaw(linkLine, true)
+            .addRaw(`\n\ncommit ${sha} · attempt ${attempt}`, true)
+            .write();
+
+          // PR comment — upsert on pull_request events when enabled.
+          if (process.env.WANT_COMMENT === 'true' && context.eventName === 'pull_request') {
+            const body =
+              `${marker}\n### 📊 Dagger trace\n\n${linkLine}\n\n` +
+              `Run: [${runUrl} (attempt ${attempt})](${runUrl}) · commit ${sha}\n`;
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner, repo, issue_number, per_page: 100,
+            });
+            const existing = comments.find((c) => c.body && c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
           }
