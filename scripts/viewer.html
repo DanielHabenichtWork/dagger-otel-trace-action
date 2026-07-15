@@ -72,6 +72,8 @@
   pre.output { margin: 0; padding: 8px 10px; background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; font: 11.5px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: 60vh; }
   pre.output .stderr { color: var(--warn); }
   .statusmsg { color: var(--err); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
+  table.attrs details summary { cursor: pointer; color: var(--fg-dim); }
+  table.attrs .rawval { margin-top: 4px; white-space: pre-wrap; word-break: break-all; color: var(--fg-dim); }
 
   /* ANSI colors */
   .a30{color:#484f58}.a31{color:#ff7b72}.a32{color:#3fb950}.a33{color:#d29922}.a34{color:#58a6ff}.a35{color:#bc8cff}.a36{color:#39c5cf}.a37{color:#b1bac4}
@@ -156,6 +158,113 @@ function attrsToObj(list) {
   return o;
 }
 
+/* ---------- dag.call decoding ----------
+   Dagger names every span after the raw dagql field (Container.withExec, from,
+   withEnvVariable, …), so the tree is full of identical labels with no context.
+   The actual command + arguments live, base64-encoded, in the dagger.io/dag.call
+   attribute (Dagger's callpbv1.Call protobuf — the same data its own TUI decodes
+   to show `exec apk add ca-certificates`). We decode it here to build a readable
+   label per span and to show the call's arguments in the detail panel.
+
+   Wire schema (field numbers verified against captured telemetry):
+     Call:     f3 = field name (string), f4 = repeated Argument
+     Argument: f1 = name (string),        f2 = Literal value
+     Literal:  f7 = string, f8 = list, f3 = bool, f5 = int, f4 = enum name,
+               f1 = reference digest (xxh3:…), f10 = metadata blob, f9 = object */
+const TDEC = new TextDecoder();
+function b64ToBytes(s) {
+  const bin = atob(s);
+  const a = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) a[i] = bin.charCodeAt(i);
+  return a;
+}
+// Walk protobuf wire format into [{field, wire, data}]; data is a Uint8Array for
+// length-delimited fields (wire 2) or a Number for varints (wire 0).
+function pbScan(bytes) {
+  const out = [];
+  let i = 0;
+  const varint = () => { let r = 0, s = 0, b; do { b = bytes[i++]; r += (b & 0x7f) * Math.pow(2, s); s += 7; } while (b & 0x80); return r; };
+  while (i < bytes.length) {
+    const tag = varint(), field = tag >> 3, wire = tag & 7;
+    if (wire === 0) out.push({ field, wire, data: varint() });
+    else if (wire === 2) { const len = varint(); out.push({ field, wire, data: bytes.subarray(i, i + len) }); i += len; }
+    else if (wire === 5) { i += 4; out.push({ field, wire, data: null }); }
+    else if (wire === 1) { i += 8; out.push({ field, wire, data: null }); }
+    else break;
+  }
+  return out;
+}
+const pbStr = (u8) => TDEC.decode(u8);
+function decodeLiteral(bytes) {
+  for (const f of pbScan(bytes)) {
+    switch (f.field) {
+      case 7: return pbStr(f.data);              // string
+      case 8: return decodeList(f.data);         // list
+      case 3: return f.data !== 0;               // bool
+      case 5: return f.data;                     // int
+      case 4: return pbStr(f.data);              // enum name
+      case 1: return pbStr(f.data);              // reference to another call (digest)
+      case 10: return pbStr(f.data);             // metadata blob
+      case 9: return "{…}";                      // nested object
+    }
+  }
+  return null;
+}
+function decodeList(bytes) {
+  const out = [];
+  for (const f of pbScan(bytes)) if (f.field === 1 && f.wire === 2) out.push(decodeLiteral(f.data));
+  return out;
+}
+function decodeDagCall(b64) {
+  let op = null; const args = [];
+  try {
+    for (const f of pbScan(b64ToBytes(b64))) {
+      if (f.field === 3 && f.wire === 2) op = pbStr(f.data);
+      else if (f.field === 4 && f.wire === 2) {
+        let name = null, value;
+        for (const a of pbScan(f.data)) {
+          if (a.field === 1 && a.wire === 2) name = pbStr(a.data);
+          else if (a.field === 2 && a.wire === 2) value = decodeLiteral(a.data);
+        }
+        args.push({ name, value });
+      }
+    }
+  } catch (e) { return null; }
+  return op ? { op, args } : null;
+}
+const litText = (v) => v == null ? "" : Array.isArray(v) ? v.map(litText).join(" ") : String(v);
+// Human label for a decoded call: common ops get a short verb + their key arg,
+// everything else falls back to "<op> <scalar args…>". Collapsed to one line.
+function callLabel(call, fallback) {
+  if (!call) return fallback;
+  const { op, args } = call;
+  const by = {};
+  for (const a of args) by[a.name] = a.value;
+  const one = (s) => s.replace(/\s+/g, " ").trim();
+  switch (op) {
+    case "withExec": return one("exec " + litText(by.args));
+    case "withEntrypoint": return one("entrypoint " + litText(by.args));
+    case "from": return "from " + litText(by.address);
+    case "withWorkdir": return "workdir " + litText(by.path);
+    case "withEnvVariable": return one("env " + litText(by.name) + "=" + litText(by.value));
+    case "withSecretVariable": return "secret-env " + litText(by.name);
+    case "withExposedPort": return "expose " + litText(by.port);
+    case "withMountedDirectory": return "mount-dir " + litText(by.path);
+    case "withMountedFile": return "mount-file " + litText(by.path);
+    case "withMountedCache": return "mount-cache " + litText(by.path);
+    case "withFile": return "file " + litText(by.path);
+    case "withNewFile": return "new-file " + litText(by.path);
+    case "withDirectory": return "with-dir " + litText(by.path);
+    case "directory": return "directory " + litText(by.path);
+    case "file": return "file " + litText(by.path);
+  }
+  const scalars = args
+    .filter(a => a.value != null && !Array.isArray(a.value))
+    .map(a => litText(a.value))
+    .filter(v => v && !v.startsWith("xxh3:"));
+  return one(op + (scalars.length ? " " + scalars.join(" ") : ""));
+}
+
 /* ---------- model ---------- */
 const state = {
   spans: new Map(),      // spanId -> span
@@ -176,9 +285,11 @@ function ingestTraces(batches) {
         const scope = (ss.scope && ss.scope.name) || "";
         for (const s of ss.spans || []) {
           const attrs = attrsToObj(s.attributes);
+          const call = attrs["dagger.io/dag.call"] ? decodeDagCall(attrs["dagger.io/dag.call"]) : null;
+          const label = callLabel(call, s.name);
           const span = {
             id: s.spanId, parent: s.parentSpanId || null, traceId: s.traceId,
-            name: s.name, service, scope,
+            name: s.name, label, call, search: (label + " " + s.name).toLowerCase(), service, scope,
             start: Number(s.startTimeUnixNano) / 1e6, end: Number(s.endTimeUnixNano) / 1e6,
             statusCode: (s.status && s.status.code) || 0,
             statusMsg: (s.status && s.status.message) || "",
@@ -277,6 +388,13 @@ function visibleChildren(span, f, parentFailed) {
 /* ---------- rendering ---------- */
 const fmtDur = ms => !isFinite(ms) || ms < 0 ? "" : ms < 1 ? ms.toFixed(2) + "ms" : ms < 1000 ? ms.toFixed(1) + "ms" : ms < 60000 ? (ms / 1000).toFixed(2) + "s" : Math.floor(ms / 60000) + "m" + ((ms % 60000) / 1000).toFixed(0) + "s";
 const esc = s => s.replace(/[&<>"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+// Render an attribute value; long/base64 blobs (e.g. dag.call) collapse behind a
+// disclosure so every attribute is present without flooding the panel.
+function attrCell(v) {
+  const s = typeof v === "string" ? v : JSON.stringify(v);
+  if (s.length > 200) return `<details><summary>${esc(s.slice(0, 48))}… (${s.length} chars)</summary><div class="rawval">${esc(s)}</div></details>`;
+  return esc(s);
+}
 
 function render() {
   const f = filters();
@@ -288,7 +406,7 @@ function render() {
 
   const addRow = (span, depth, parentFailed) => {
     const kids = visibleChildren(span, f, span.statusCode === 2 || parentFailed);
-    const isMatch = q && span.name.toLowerCase().includes(q);
+    const isMatch = q && span.search.includes(q);
     if (isMatch) matches++;
     const open = state.expanded.has(span.id) || (q && subtreeMatches(span, q));
     const row = document.createElement("div");
@@ -298,7 +416,7 @@ function render() {
     const width = (Math.max(span.end - span.start, 0) / total * 100).toFixed(3);
     row.innerHTML =
       `<span class="twisty">${kids.length ? (open ? "▾" : "▸") : ""}</span>` +
-      `<span class="name">${esc(span.name)}</span>` +
+      `<span class="name">${esc(span.label)}</span>` +
       (span.checkName ? `<span class="badge ${span.checkPassed === false ? "check-fail" : "check-ok"}">${span.checkPassed === false ? "✗ FAILED" : "✓ CHECK"}</span>` : "") +
       (span.statusCode === 2 ? `<span class="badge error">ERROR</span>` : span.errDeep ? `<span class="badge errdeep">error inside</span>` : "") +
       (span.cached ? `<span class="badge cached">CACHED</span>` : "") +
@@ -318,7 +436,7 @@ const matchCache = new Map();
 function subtreeMatches(span, q) {
   const key = span.id + "\0" + q;
   if (matchCache.has(key)) return matchCache.get(key);
-  let m = span.children.some(c => c.name.toLowerCase().includes(q) || subtreeMatches(c, q));
+  let m = span.children.some(c => c.search.includes(q) || subtreeMatches(c, q));
   matchCache.set(key, m);
   return m;
 }
@@ -378,7 +496,7 @@ function select(id) {
   const span = state.spans.get(id);
   const panel = document.getElementById("detail");
   panel.classList.add("open");
-  document.getElementById("dname").textContent = span.name;
+  document.getElementById("dname").textContent = span.label;
   const dur = fmtDur(span.end - span.start);
   document.getElementById("dsub").textContent =
     `${span.service || "?"} · ${span.scope || "?"} · ${dur}` + (span.cached ? " · CACHED" : "") + (span.statusCode === 2 ? " · ERROR" : "");
@@ -399,13 +517,26 @@ function select(id) {
   deepBox.addEventListener("change", update);
   update();
 
-  const attrs = Object.entries(span.attrs).filter(([k]) => k !== "dagger.io/dag.call");
+  // Decoded call: op + one row per argument, so the command/arguments behind the
+  // span are legible instead of hidden in the base64 dag.call attribute.
+  if (span.call) {
+    const argRows = span.call.args
+      .map(a => `<tr><td>${esc(a.name || "")}</td><td>${esc(litText(a.value))}</td></tr>`)
+      .join("");
+    const callSec = document.createElement("section");
+    callSec.innerHTML = `<h3>Call</h3><table class="attrs">
+      <tr><td>op</td><td>${esc(span.call.op)}</td></tr>${argRows}</table>`;
+    body.appendChild(callSec);
+  }
+  // Every attribute is shown (nothing dropped); long/base64 values collapse.
+  const attrs = Object.entries(span.attrs);
   const timing = document.createElement("section");
   timing.innerHTML = `<h3>Span</h3><table class="attrs">
     <tr><td>span / trace</td><td>${span.id} / ${span.traceId}</td></tr>
+    <tr><td>dagql</td><td>${esc(span.name)}</td></tr>
     <tr><td>start</td><td>${new Date(span.start).toISOString()}</td></tr>
     <tr><td>duration</td><td>${dur}</td></tr>
-    ${attrs.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${esc(typeof v === "string" ? v : JSON.stringify(v))}</td></tr>`).join("")}
+    ${attrs.map(([k, v]) => `<tr><td>${esc(k)}</td><td>${attrCell(v)}</td></tr>`).join("")}
   </table>`;
   body.appendChild(timing);
   render();
@@ -425,7 +556,7 @@ function renderSummary() {
   }
   if (!checks.length && errors.length) chips.push(`<span class="chip plain">${errors.length} error span(s)</span>`);
   for (const e of errors.slice(0, 8)) {
-    chips.push(`<span class="chip err" data-goto="${e.id}">⚠ ${esc(e.name.slice(0, 60))}</span>`);
+    chips.push(`<span class="chip err" data-goto="${e.id}">⚠ ${esc(e.label.slice(0, 60))}</span>`);
   }
   el.innerHTML = chips.join("");
   el.querySelectorAll("[data-goto]").forEach(chip => chip.addEventListener("click", () => {
