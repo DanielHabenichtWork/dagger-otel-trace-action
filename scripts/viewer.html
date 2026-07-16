@@ -69,8 +69,14 @@
   table.attrs { border-collapse: collapse; width: 100%; font-size: 12px; }
   table.attrs td { padding: 2px 8px 2px 0; vertical-align: top; font-family: var(--mono); word-break: break-all; }
   table.attrs td:first-child { color: var(--fg-dim); white-space: nowrap; }
-  pre.output { margin: 0; padding: 8px 10px; background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; font: 11.5px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: 60vh; }
-  pre.output .stderr { color: var(--warn); }
+  .output { margin: 0; padding: 8px 10px; background: #0a0d12; border: 1px solid var(--border); border-radius: 6px; font: 11.5px/1.5 var(--mono); white-space: pre-wrap; word-break: break-word; overflow: auto; max-height: 60vh; }
+  .output .stderr { color: var(--warn); }
+  .output .logline { display: flex; gap: 10px; }
+  .output .logline .ts { flex: 0 0 auto; width: 8ch; text-align: right; color: var(--fg-dim); user-select: none; }
+  .output .logline .gap { flex: 0 0 auto; width: 7ch; user-select: none; font-size: 10.5px; line-height: 1.6; }
+  .output .logline .gap.lo { color: var(--warn); }
+  .output .logline .gap.hi { color: var(--err); font-weight: 600; }
+  .output .logline .txt { white-space: pre-wrap; word-break: break-word; min-width: 0; flex: 1 1 auto; }
   .statusmsg { color: var(--err); font-family: var(--mono); font-size: 12px; white-space: pre-wrap; word-break: break-word; }
   table.attrs details summary { cursor: pointer; color: var(--fg-dim); }
   table.attrs .rawval { margin-top: 4px; white-space: pre-wrap; word-break: break-all; color: var(--fg-dim); }
@@ -486,10 +492,65 @@ function collectLogs(span, deep) {
   visit(span);
   return recs.sort((a, b) => a.t - b.t);
 }
-function renderLogsInto(el, span, deep) {
+// Wall-clock HH:MM:SS.mmm from a nanosecond timestamp (log records carry ns).
+const fmtClock = (tNs) => new Date(tNs / 1e6).toISOString().slice(11, 23);
+// Elapsed offset (Dagger-style "+1.2s" / "+1m03s") for the gutter.
+function fmtElapsed(ms) {
+  if (ms < 0) ms = 0;
+  if (ms < 1000) return "+" + Math.round(ms) + "ms";
+  const s = ms / 1000;
+  if (s < 60) return "+" + s.toFixed(1) + "s";
+  const m = Math.floor(s / 60);
+  return "+" + m + "m" + String(Math.round(s - m * 60)).padStart(2, "0") + "s";
+}
+// Gap between two lines, shown only when it's worth noticing (see GAP_MIN_MS).
+function fmtGap(ms) {
+  const s = ms / 1000;
+  if (s < 60) return "▲" + s.toFixed(1) + "s";
+  const m = Math.floor(s / 60);
+  return "▲" + m + "m" + String(Math.round(s - m * 60)).padStart(2, "0") + "s";
+}
+const GAP_MIN_MS = 1000; // below this a gap is normal fast logging → no marker
+// Re-split records into logical lines, tagging each with the timestamp of the
+// record that started it. Records may hold several newline-separated lines or a
+// trailing partial line continued by the next record, so we track line starts
+// rather than assuming one record == one line.
+function splitLogLines(recs) {
+  const lines = [];
+  let cur = null;
+  for (const r of recs) {
+    const parts = r.body.split("\n");
+    for (let i = 0; i < parts.length; i++) {
+      if (!cur) cur = { t: r.t, stream: r.stream, text: "" };
+      cur.text += parts[i];
+      if (i < parts.length - 1) { lines.push(cur); cur = null; }
+    }
+  }
+  if (cur && cur.text.length) lines.push(cur);
+  return lines;
+}
+function renderLogsInto(el, span, deep, withTiming) {
   const recs = collectLogs(span, deep);
   if (!recs.length) { el.innerHTML = '<span style="color:var(--fg-dim)">no output</span>'; return; }
-  el.innerHTML = recs.map(r => `<span class="${r.stream === 2 ? "stderr" : "stdout"}">${ansiToHtml(r.body)}</span>`).join("");
+  if (!withTiming) {
+    el.innerHTML = recs.map(r => `<span class="${r.stream === 2 ? "stderr" : "stdout"}">${ansiToHtml(r.body)}</span>`).join("");
+    return;
+  }
+  // Elapsed is measured from the task's start; the gap chip surfaces only lines
+  // that follow a pause, so fast output stays quiet and stalls stand out.
+  const lines = splitLogLines(recs);
+  const ref = span.start; // ms
+  let prev = null;
+  el.innerHTML = lines.map(l => {
+    const tms = l.t / 1e6;
+    const gap = prev === null ? 0 : tms - prev;
+    prev = tms;
+    const gapCell = gap >= GAP_MIN_MS
+      ? `<span class="gap ${gap >= 10000 ? "hi" : "lo"}">${fmtGap(gap)}</span>`
+      : `<span class="gap"></span>`;
+    return `<div class="logline"><span class="ts" title="${fmtClock(l.t)}">${fmtElapsed(tms - ref)}</span>` +
+      `${gapCell}<span class="txt ${l.stream === 2 ? "stderr" : "stdout"}">${ansiToHtml(l.text) || " "}</span></div>`;
+  }).join("");
 }
 function select(id) {
   state.selected = id;
@@ -509,12 +570,17 @@ function select(id) {
     body.appendChild(sec);
   }
   const logSec = document.createElement("section");
-  logSec.innerHTML = `<h3>Output <label style="font-weight:normal;text-transform:none;letter-spacing:0;margin-left:8px"><input type="checkbox" id="deep-logs" checked> include children</label></h3><pre class="output"></pre>`;
+  const lbl = `font-weight:normal;text-transform:none;letter-spacing:0;margin-left:8px`;
+  logSec.innerHTML = `<h3>Output` +
+    `<label style="${lbl}"><input type="checkbox" id="deep-logs" checked> include children</label>` +
+    `<label style="${lbl}"><input type="checkbox" id="ts-logs" checked> timing</label></h3><div class="output"></div>`;
   body.appendChild(logSec);
-  const pre = logSec.querySelector("pre");
+  const pre = logSec.querySelector(".output");
   const deepBox = logSec.querySelector("#deep-logs");
-  const update = () => renderLogsInto(pre, span, deepBox.checked);
+  const tsBox = logSec.querySelector("#ts-logs");
+  const update = () => renderLogsInto(pre, span, deepBox.checked, tsBox.checked);
   deepBox.addEventListener("change", update);
+  tsBox.addEventListener("change", update);
   update();
 
   // Decoded call: op + one row per argument, so the command/arguments behind the
