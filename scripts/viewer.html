@@ -302,6 +302,11 @@ function ingestTraces(batches) {
             attrs,
             cached: !!attrs["dagger.io/dag.cached"],
             internal: !!attrs["dagger.io/ui.internal"],
+            // Engine bootstrap + low-level otel grpc/http instrumentation. Not
+            // reliably marked ui.internal, so derive it from the scope and treat
+            // its errors like internal noise (transient connect/resolve retries)
+            // unless the parent failed.
+            infra: scope.startsWith("go.opentelemetry.io/") || scope === "dagger.io/engine.client",
             passthrough: !!attrs["dagger.io/ui.passthrough"],
             encapsulated: !!attrs["dagger.io/ui.encapsulated"],
             checkName: attrs["dagger.io/check.name"],
@@ -352,16 +357,17 @@ function buildTree() {
   for (const span of state.spans.values()) span.children.sort(byStart);
   state.roots.sort(byStart);
   // deep flags: does subtree contain an error / any logs?
-  // Errors inside internal or encapsulated subtrees are expected noise
-  // (e.g. registry HEAD 404s during image resolution) unless the parent
-  // itself failed, matching how the Dagger TUI surfaces them.
+  // Errors inside internal, encapsulated, or infra subtrees are expected noise
+  // (e.g. registry HEAD 404s during image resolution, transient engine-connect
+  // retries) unless the parent itself failed, matching how the Dagger TUI
+  // surfaces them.
   const visit = (span, suppressed) => {
     span.hasLogs = state.logsBySpan.has(span.id);
     span.errVisible = span.statusCode === 2 && !suppressed;
     span.errDeep = span.errVisible;
     span.logsDeep = span.hasLogs;
     for (const c of span.children) {
-      visit(c, suppressed || c.internal || (c.encapsulated && span.statusCode !== 2));
+      visit(c, suppressed || c.internal || ((c.encapsulated || c.infra) && span.statusCode !== 2));
       span.errDeep = span.errDeep || c.errDeep;
       span.logsDeep = span.logsDeep || c.logsDeep;
     }

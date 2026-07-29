@@ -291,8 +291,10 @@ const markErrors = (span, suppressed) => {
   let childErr = false;
   for (const c of span.children)
     childErr =
-      markErrors(c, suppressed || c.internal || (c.encapsulated && span.statusCode !== 2)) ||
-      childErr;
+      markErrors(
+        c,
+        suppressed || c.internal || ((c.encapsulated || c.infra) && span.statusCode !== 2),
+      ) || childErr;
   span.childErr = childErr; // a descendant surfaced an error
   span.subtreeErr = span.errVisible || childErr;
   return span.subtreeErr;
