@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  biome:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write   # for the trace PR comment
+    steps:
+      - uses: actions/checkout@v4
+
+      # Capture the Dagger telemetry — dogfooding this repo's own action.
+      - uses: ./start
+        id: trace
+        continue-on-error: true
+
+      # The pipeline: Biome formatting + lint over the repo. `dagger check`
+      # runs the check-annotated function in the root module (.dagger source).
+      - uses: dagger/dagger-for-github@v8
+        with:
+          verb: check
+
+      # Bundle the trace, upload it, and link it from the run + PR.
+      - uses: ./finish
+        if: ${{ always() && steps.trace.outcome == 'success' }}
+        continue-on-error: true
+        with:
+          title: "biome check"

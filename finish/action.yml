@@ -57,6 +57,18 @@ runs:
         "$GITHUB_ACTION_PATH/../scripts/finish.sh" "$data_dir" "$out" "$data_dir/meta.json"
         echo "output=$out" >> "$GITHUB_OUTPUT"
 
+        # Agent-friendly text summary — what's slow, what failed (line-numbered
+        # logs), the span tree. The same thing `dagger-trace --format agent`
+        # prints locally. Node is preinstalled on GitHub runners; if it's absent
+        # we just skip the summary rather than failing the build.
+        summary="$data_dir/dagger-trace-summary.md"
+        if command -v node >/dev/null 2>&1 \
+           && node "$GITHUB_ACTION_PATH/../scripts/summarize.mjs" "$data_dir" \
+                --title "${{ inputs.title }}" > "$summary" 2>/dev/null; then
+          echo "summary=$summary" >> "$GITHUB_OUTPUT"
+        fi
+        echo "data-dir=$data_dir" >> "$GITHUB_OUTPUT"
+
     # archive: false uploads the single HTML as-is (no zip); the download is the
     # file itself, served text/html + inline so it renders in the browser.
     - id: upload
@@ -67,28 +79,86 @@ runs:
         overwrite: true
         retention-days: ${{ inputs.retention-days }}
 
+    # Second artifact: the raw collector capture + the text summary. Agents can
+    # `gh run download` this and drill into any step with
+    # `dagger-trace report --grep … --full <dir>` — no HTML blob to parse.
+    - id: upload-raw
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+      with:
+        name: ${{ inputs.artifact-name }}-raw
+        path: |
+          ${{ steps.bundle.outputs.data-dir }}/traces.jsonl
+          ${{ steps.bundle.outputs.data-dir }}/logs.jsonl
+          ${{ steps.bundle.outputs.summary }}
+        if-no-files-found: ignore
+        overwrite: true
+        retention-days: ${{ inputs.retention-days }}
+
     # Link the artifact from the run's job summary (every run), and upsert a
     # single marker-keyed PR comment (pull_request events only).
     - if: ${{ steps.upload.outputs.artifact-url }}
       uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
       env:
         ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        RAW_ARTIFACT_URL: ${{ steps.upload-raw.outputs.artifact-url }}
+        RAW_ARTIFACT_NAME: ${{ inputs.artifact-name }}-raw
+        SUMMARY_FILE: ${{ steps.bundle.outputs.summary }}
         WANT_COMMENT: ${{ inputs.comment }}
       with:
         github-token: ${{ inputs.github-token }}
         script: |
+          const fs = require('fs');
           const url = process.env.ARTIFACT_URL;
-          // Pure markdown (no HTML) so GitHub renders it in both the job
-          // summary and the PR comment.
           const line = `### 📊 [View the Dagger trace](${url})`;
 
+          // How to get the raw traces/logs and drill into a step. The raw
+          // artifact holds traces.jsonl + logs.jsonl + the summary; `gh run
+          // download` fetches it, then `dagger-trace report` re-analyzes it
+          // offline. `gh` needs no run id — it defaults to the current run.
+          const rawUrl = process.env.RAW_ARTIFACT_URL;
+          const rawName = process.env.RAW_ARTIFACT_NAME;
+          const runId = context.runId;
+          const howto = rawUrl
+            ? [
+                '',
+                `Raw traces + logs: [\`${rawName}\`](${rawUrl}) — download and drill into a step offline:`,
+                '',
+                '```sh',
+                `gh run download ${runId} -n ${rawName} -D dagger-trace`,
+                `npx dagger-trace report --grep '<step>' --full dagger-trace`,
+                '```',
+              ].join('\n')
+            : '';
+
+          // Embed the compact agent summary inline, behind a <details> so humans
+          // see just the link while agents (and anyone reading the raw markdown)
+          // get "what's slow / what failed" with no download. Capped so a huge
+          // run can't blow the ~1 MiB summary/comment limits — the full text is
+          // always in the `-raw` artifact.
+          const CAP = 50_000;
+          let details = '';
+          const f = process.env.SUMMARY_FILE;
+          if (f && fs.existsSync(f)) {
+            let text = fs.readFileSync(f, 'utf8').trimEnd();
+            if (text) {
+              if (text.length > CAP) {
+                text = text.slice(0, CAP) +
+                  '\n… (truncated — full summary in the -raw artifact)';
+              }
+              // 4-backtick fence so the summary's own text can't close it early.
+              details = `\n<details><summary>Trace summary (for agents / triage)` +
+                `</summary>\n\n\`\`\`\`\n${text}\n\`\`\`\`\n${howto}\n\n</details>\n`;
+            }
+          }
+          const block = `${line}\n${details}`;
+
           // Job summary — shown on the run's Summary page for every run.
-          await core.summary.addRaw(line + '\n').write();
+          await core.summary.addRaw(block + '\n').write();
 
           // PR comment — upsert a single marker-keyed comment (PRs only).
           if (process.env.WANT_COMMENT === 'true' && context.eventName === 'pull_request') {
             const marker = '<!-- dagger-trace-viewer -->';
-            const body = `${marker}\n${line}\n`;
+            const body = `${marker}\n${block}`;
             const { owner, repo } = context.repo;
             const issue_number = context.issue.number;
             const comments = await github.paginate(github.rest.issues.listComments, {

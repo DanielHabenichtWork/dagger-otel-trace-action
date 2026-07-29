@@ -1,0 +1,46 @@
+{
+  "name": "@danielhabenichtwork/dagger-trace",
+  "version": "1.4.0",
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com"
+  },
+  "description": "Wrap a dagger command locally, capture its OpenTelemetry stream, and open the same self-contained trace viewer you get in CI — no Dagger Cloud.",
+  "bin": {
+    "dagger-trace": "dagger-trace"
+  },
+  "files": [
+    "dagger-trace",
+    "scripts/start.sh",
+    "scripts/finish.sh",
+    "scripts/bundle.sh",
+    "scripts/summarize.mjs",
+    "scripts/collector-config.yaml",
+    "scripts/viewer.html"
+  ],
+  "scripts": {
+    "test": "bash -n dagger-trace"
+  },
+  "keywords": [
+    "dagger",
+    "opentelemetry",
+    "otel",
+    "otlp",
+    "trace",
+    "tracing",
+    "ci",
+    "observability"
+  ],
+  "homepage": "https://github.com/DanielHabenichtWork/dagger-otel-trace-action#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DanielHabenichtWork/dagger-otel-trace-action.git"
+  },
+  "bugs": {
+    "url": "https://github.com/DanielHabenichtWork/dagger-otel-trace-action/issues"
+  },
+  "license": "MIT",
+  "os": ["darwin", "linux"],
+  "engines": {
+    "node": ">=16"
+  }
+}

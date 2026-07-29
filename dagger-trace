@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# dagger-trace — run a dagger command locally, capture its OpenTelemetry stream,
+# and open the same self-contained trace viewer you get in CI.
+#
+# usage:
+#   dagger-trace [options] <dagger args...>        # wraps `dagger <args>`
+#   dagger-trace [options] -- <command> [args...]  # wraps an arbitrary command
+#   dagger-trace report [report-opts] <data-dir>   # re-analyze a past capture
+#
+# examples:
+#   dagger-trace check                             # runs `dagger check`, traced
+#   dagger-trace --format agent check              # ...as an agent sees it
+#   dagger-trace call test
+#   dagger-trace --serve call build --platform=linux/amd64
+#   dagger-trace --format agent -- make ci
+#   dagger-trace report --grep "go test" --full /tmp/dagger-otel.XXXX
+#
+# options:
+#   --format FMT     auto (default) | html | agent | both
+#                      auto  — agent when the caller looks like an agent/script
+#                              (stdout not a terminal, or CI/CLAUDECODE/… set),
+#                              html otherwise. Explicit values skip detection.
+#                      html  — self-contained viewer, opened in the browser
+#                      agent — compact text summary to stdout (low-token:
+#                              slowest steps, failing steps with line-numbered
+#                              logs, and the span tree)
+#                      both  — write the HTML and print the summary
+#   --data-dir DIR   collector output dir (default: a fresh mktemp dir)
+#   --out FILE       viewer HTML path (default: dagger-trace.html in the capture
+#                    data-dir, i.e. a tmp dir)
+#   --title TITLE    header title shown in the viewer (default: the command)
+#   --serve [PORT]   serve the HTML over HTTP and open it (default port 8000)
+#                    instead of opening the file directly
+#   --no-open        build the HTML but don't open a browser
+#   -h, --help       show this help
+#
+# report-opts (for drilling into a capture, agent format):
+#   --grep STEP      focus on steps matching STEP; print their subtree + logs
+#   --all            include infra/internal spans normally hidden
+#   --full           don't truncate step logs
+#   --top N          number of slowest steps to list (default 8)
+#   --max-log-lines N  cap per-step log lines when not --full (default 40)
+#
+# Requires Docker (the collector runs as a container) and the `dagger` CLI;
+# the agent format and `report` also need `node`.
+set -euo pipefail
+
+# Resolve our own location through any symlinks (npm's global bin is a symlink
+# into node_modules), following relative and chained targets, so we can find
+# the sibling scripts/ dir regardless of how we were invoked.
+src="${BASH_SOURCE[0]}"
+while [[ -h "$src" ]]; do
+  dir="$(cd -P "$(dirname "$src")" && pwd)"
+  src="$(readlink "$src")"
+  [[ "$src" != /* ]] && src="$dir/$src"
+done
+self="$(cd -P "$(dirname "$src")" && pwd)"
+scripts="$self/scripts"
+
+# `report`: re-analyze an already-captured data dir (no collector, no command).
+# All remaining args pass straight to the summarizer, so an agent can drill in:
+#   dagger-trace report --grep "go test" --full <data-dir>
+if [[ "${1:-}" == "report" ]]; then
+  shift
+  if ! command -v node >/dev/null 2>&1; then
+    echo "error: report needs node on PATH" >&2; exit 1
+  fi
+  exec node "$scripts/summarize.mjs" "$@"
+fi
+
+data_dir=""
+out=""
+title=""
+format=auto
+serve=""
+port=8000
+open=1
+
+usage() { sed -n '2,/^set -euo/p' "${BASH_SOURCE[0]}" | sed '$d; s/^# \{0,1\}//'; }
+
+# Split options from the wrapped command. Options are only recognised before
+# the first non-option token (or an explicit `--`); everything after is the
+# command, so `dagger-trace call --foo` passes `--foo` through to dagger.
+cmd=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --data-dir) data_dir=$2; shift 2 ;;
+    --out) out=$2; shift 2 ;;
+    --title) title=$2; shift 2 ;;
+    --format) format=$2; shift 2 ;;
+    --serve)
+      serve=1; shift
+      if [[ $# -gt 0 && "$1" =~ ^[0-9]+$ ]]; then port=$1; shift; fi ;;
+    --no-open) open=0; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; cmd=("$@"); break ;;
+    *) cmd=(dagger "$@"); break ;;
+  esac
+done
+
+if [[ ${#cmd[@]} -eq 0 ]]; then
+  echo "error: no command to run" >&2
+  usage >&2
+  exit 2
+fi
+
+case "$format" in
+  auto|html|agent|both) ;;
+  *) echo "error: --format must be auto, html, agent, or both (got '$format')" >&2; exit 2 ;;
+esac
+
+# `auto`: pick the agent-friendly text summary when the caller looks like an
+# agent or script rather than an interactive human. stdout not being a terminal
+# is the reliable, harness-agnostic signal (agents capture stdout); a handful of
+# well-known agent/CI env vars cover harnesses that allocate a PTY. Fall back to
+# html when node (needed to render the summary) is missing.
+if [[ "$format" == auto ]]; then
+  if { [[ ! -t 1 ]] || [[ -n "${CI:-}" ]] || [[ -n "${CLAUDECODE:-}" ]] \
+       || [[ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]] || [[ -n "${AGENT:-}" ]] \
+       || [[ "${TERM:-}" == dumb ]]; } && command -v node >/dev/null 2>&1; then
+    format=agent
+  else
+    format=html
+  fi
+fi
+
+if ! command -v docker >/dev/null 2>&1; then
+  echo "error: docker is required (the collector runs as a container)" >&2
+  exit 1
+fi
+
+if [[ "$format" != html && ! $(command -v node) ]]; then
+  echo "error: --format $format needs node on PATH (it renders the text summary)" >&2
+  exit 1
+fi
+
+if [[ -z "$data_dir" ]]; then
+  data_dir=$(mktemp -d "${TMPDIR:-/tmp}/dagger-otel.XXXXXX")
+fi
+mkdir -p "$data_dir"
+
+# Default the viewer HTML next to the raw capture (a tmp dir) rather than
+# dropping it into the current working directory.
+[[ -z "$out" ]] && out="$data_dir/dagger-trace.html"
+
+name="dagger-otel-local-$$"
+cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+trap cleanup EXIT
+
+# Start the collector and pull the exported OTEL_* vars into this shell, so the
+# wrapped command's dagger sends its telemetry to the sidecar.
+eval "$("$scripts/start.sh" "$data_dir" "$name")"
+
+echo "+ ${cmd[*]}" >&2
+set +e
+"${cmd[@]}"
+status=$?
+set -e
+
+# Stop the collector gracefully so the file exporter flushes to disk before we
+# read the captured telemetry.
+docker stop "$name" >/dev/null 2>&1 || true
+docker rm "$name"   >/dev/null 2>&1 || true
+
+# Compact text summary — printed to stdout so an agent can capture it.
+if [[ "$format" == agent || "$format" == both ]]; then
+  node "$scripts/summarize.mjs" "$data_dir" --title "${title:-${cmd[*]}}"
+  # Tell the caller where the raw capture lives and how to drill into a step.
+  echo "» capture: $data_dir  ·  drill in: $(basename "$0") report --grep '<step>' --full '$data_dir'" >&2
+fi
+
+if [[ "$format" == agent ]]; then
+  exit "$status"
+fi
+
+# Build local run metadata (best-effort git context); bundle.sh embeds it in
+# the viewer header. Fields left empty are simply omitted by the viewer.
+json_str() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "$s"; }
+git_val() { git "$@" 2>/dev/null || true; }
+meta="$data_dir/meta.json"
+{
+  printf '{\n'
+  printf '  "title": %s,\n' "$(json_str "${title:-${cmd[*]}}")"
+  printf '  "repo": %s,\n'  "$(json_str "$(basename "$(git_val rev-parse --show-toplevel)")")"
+  printf '  "ref": %s,\n'   "$(json_str "$(git_val rev-parse --abbrev-ref HEAD)")"
+  printf '  "sha": %s,\n'   "$(json_str "$(git_val rev-parse HEAD)")"
+  printf '  "date": %s\n'   "$(json_str "$(date -u +%FT%TZ)")"
+  printf '}\n'
+} > "$meta"
+
+# Bundle the self-contained viewer HTML.
+"$scripts/bundle.sh" "$data_dir" "$out" "$meta"
+
+# Show it: either a foreground HTTP server, or open the self-contained file
+# directly (it has no external fetches, so file:// works fine).
+open_url() {
+  [[ "$open" -eq 1 ]] || return 0
+  if command -v open >/dev/null 2>&1; then open "$1"
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$1"
+  else echo "open manually: $1" >&2; fi
+}
+
+if [[ -n "$serve" ]]; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "error: --serve needs python3; open the file directly instead: $out" >&2
+    exit "$status"
+  fi
+  dir=$(cd "$(dirname "$out")" && pwd)
+  base=$(basename "$out")
+  echo "serving http://127.0.0.1:$port/$base  (Ctrl-C to stop)" >&2
+  ( open_url "http://127.0.0.1:$port/$base" & )
+  cd "$dir"
+  exec python3 -m http.server "$port" --bind 127.0.0.1
+else
+  echo "trace written to $out" >&2
+  open_url "file://$out"
+fi
+
+exit "$status"
