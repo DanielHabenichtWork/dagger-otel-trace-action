@@ -42,7 +42,7 @@ jobs:
         continue-on-error: true      # telemetry must never fail the build
 
       # 2. Run dagger however you like — the env is already set.
-      - uses: dagger/dagger-for-github@v8
+      - uses: dagger/dagger-for-github@v8.4.1
         with: { verb: check }
 
       # 3. Bundle + upload + (on PRs) comment. always() so a failed build still

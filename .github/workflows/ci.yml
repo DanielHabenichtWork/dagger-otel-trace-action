@@ -21,7 +21,7 @@ jobs:
 
       # The pipeline: Biome formatting + lint over the repo. `dagger check`
       # runs the check-annotated function in the root module (.dagger source).
-      - uses: dagger/dagger-for-github@v8
+      - uses: dagger/dagger-for-github@v8.4.1
         with:
           verb: check
 
