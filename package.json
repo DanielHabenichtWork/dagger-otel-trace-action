@@ -1,6 +1,6 @@
 {
   "name": "@danielhabenichtwork/dagger-trace",
-  "version": "1.4.2",
+  "version": "1.4.3",
   "publishConfig": {
     "registry": "https://npm.pkg.github.com"
   },

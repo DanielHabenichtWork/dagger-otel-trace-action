@@ -81,10 +81,10 @@ re-analyze any step offline, straight from the links in front of it.
 The summary link lands where the event can carry it: on **`pull_request`** runs
 it's upserted into a PR comment (unless `comment: false`) *and* the job summary;
 on **`push`** and other events there's no PR to comment on, so it's on the run's
-**Summary** page only. Rendering the summary needs Node — GitHub-hosted runners
-have it; on a **self-hosted runner without Node** `finish` falls back to a Node
-container (Docker is already required for the collector), so the agent summary
-still appears. With no Node *and* no Docker it's skipped (the link still works).
+**Summary** page only. The summary is rendered with the **runner's own Node** —
+the interpreter that already runs JavaScript actions like `actions/github-script`
+— so it works on self-hosted runners with no Node on `PATH`, no Docker or
+`setup-node` needed.
 
 ## Local CLI
 

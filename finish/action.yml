@@ -56,32 +56,45 @@ runs:
           '$ARGS.named' > "$data_dir/meta.json"
         "$GITHUB_ACTION_PATH/../scripts/finish.sh" "$data_dir" "$out" "$data_dir/meta.json"
         echo "output=$out" >> "$GITHUB_OUTPUT"
-
-        # Agent-friendly text summary — what's slow, what failed (line-numbered
-        # logs), the span tree. The same thing `dagger-trace --format agent`
-        # prints locally. Prefer host node (GitHub-hosted runners have it); on a
-        # self-hosted runner without node, fall back to a node container (Docker
-        # is already required for the collector). If neither is available we skip
-        # the summary rather than failing the build.
-        summary="$data_dir/dagger-trace-summary.md"
-        title="${{ inputs.title }}"
-        scripts_dir="$(cd "$GITHUB_ACTION_PATH/../scripts" && pwd)"
-        gen_summary() {
-          if command -v node >/dev/null 2>&1; then
-            node "$scripts_dir/summarize.mjs" "$data_dir" --title "$title"
-          elif command -v docker >/dev/null 2>&1; then
-            docker run --rm --user "$(id -u):$(id -g)" \
-              -v "$data_dir":/data:ro -v "$scripts_dir":/scripts:ro \
-              node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 \
-              node /scripts/summarize.mjs /data --title "$title"
-          else
-            return 1
-          fi
-        }
-        if gen_summary > "$summary" 2>/dev/null && [ -s "$summary" ]; then
-          echo "summary=$summary" >> "$GITHUB_OUTPUT"
-        fi
         echo "data-dir=$data_dir" >> "$GITHUB_OUTPUT"
+        # Hand the sibling scripts/ dir to the summarize step below. GITHUB_ACTION_PATH
+        # points at this composite action here, but a nested `uses:` step gets its
+        # own action path, so it can't resolve ../scripts itself.
+        echo "scripts-dir=$(cd "$GITHUB_ACTION_PATH/../scripts" && pwd)" >> "$GITHUB_OUTPUT"
+
+    # Agent-friendly text summary — slowest steps, failing steps with
+    # line-numbered logs, the span tree (what `dagger-trace --format agent`
+    # prints locally). summarize.mjs is dependency-free Node; run it with the
+    # runner's own Node — the interpreter already executing this JS step
+    # (process.execPath) — so it works on self-hosted runners with no Node on
+    # PATH, without Docker or setup-node. Never fails the build.
+    - id: summarize
+      uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        DATA_DIR: ${{ steps.bundle.outputs.data-dir }}
+        SCRIPTS_DIR: ${{ steps.bundle.outputs.scripts-dir }}
+        TITLE: ${{ inputs.title }}
+      with:
+        script: |
+          const { execFileSync } = require('child_process');
+          const path = require('path');
+          const fs = require('fs');
+          const dataDir = process.env.DATA_DIR;
+          const out = path.join(dataDir, 'dagger-trace-summary.md');
+          try {
+            const text = execFileSync(
+              process.execPath,
+              [path.join(process.env.SCRIPTS_DIR, 'summarize.mjs'), dataDir,
+               '--title', process.env.TITLE || 'dagger trace'],
+              { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 },
+            );
+            if (text && text.trim()) {
+              fs.writeFileSync(out, text);
+              core.setOutput('summary', out);
+            }
+          } catch (e) {
+            core.warning(`dagger trace summary skipped: ${e.message}`);
+          }
 
     # archive: false uploads the single HTML as-is (no zip); the download is the
     # file itself, served text/html + inline so it renders in the browser.
@@ -103,7 +116,7 @@ runs:
         path: |
           ${{ steps.bundle.outputs.data-dir }}/traces.jsonl
           ${{ steps.bundle.outputs.data-dir }}/logs.jsonl
-          ${{ steps.bundle.outputs.summary }}
+          ${{ steps.summarize.outputs.summary }}
         if-no-files-found: ignore
         overwrite: true
         retention-days: ${{ inputs.retention-days }}
@@ -116,7 +129,7 @@ runs:
         ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
         RAW_ARTIFACT_URL: ${{ steps.upload-raw.outputs.artifact-url }}
         RAW_ARTIFACT_NAME: ${{ inputs.artifact-name }}-raw
-        SUMMARY_FILE: ${{ steps.bundle.outputs.summary }}
+        SUMMARY_FILE: ${{ steps.summarize.outputs.summary }}
         WANT_COMMENT: ${{ inputs.comment }}
       with:
         github-token: ${{ inputs.github-token }}
