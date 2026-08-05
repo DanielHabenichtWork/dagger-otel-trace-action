@@ -78,6 +78,14 @@ npx dagger-trace report --grep '<step>' --full dagger-trace
 So an agent that wants more than the summary can pull the raw traces/logs and
 re-analyze any step offline, straight from the links in front of it.
 
+The summary link lands where the event can carry it: on **`pull_request`** runs
+it's upserted into a PR comment (unless `comment: false`) *and* the job summary;
+on **`push`** and other events there's no PR to comment on, so it's on the run's
+**Summary** page only. Rendering the summary needs Node — GitHub-hosted runners
+have it; on a **self-hosted runner without Node** `finish` falls back to a Node
+container (Docker is already required for the collector), so the agent summary
+still appears. With no Node *and* no Docker it's skipped (the link still works).
+
 ## Local CLI
 
 `dagger-trace` wraps a dagger command on your machine and produces the **same**

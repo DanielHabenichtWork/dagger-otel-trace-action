@@ -59,12 +59,26 @@ runs:
 
         # Agent-friendly text summary — what's slow, what failed (line-numbered
         # logs), the span tree. The same thing `dagger-trace --format agent`
-        # prints locally. Node is preinstalled on GitHub runners; if it's absent
-        # we just skip the summary rather than failing the build.
+        # prints locally. Prefer host node (GitHub-hosted runners have it); on a
+        # self-hosted runner without node, fall back to a node container (Docker
+        # is already required for the collector). If neither is available we skip
+        # the summary rather than failing the build.
         summary="$data_dir/dagger-trace-summary.md"
-        if command -v node >/dev/null 2>&1 \
-           && node "$GITHUB_ACTION_PATH/../scripts/summarize.mjs" "$data_dir" \
-                --title "${{ inputs.title }}" > "$summary" 2>/dev/null; then
+        title="${{ inputs.title }}"
+        scripts_dir="$(cd "$GITHUB_ACTION_PATH/../scripts" && pwd)"
+        gen_summary() {
+          if command -v node >/dev/null 2>&1; then
+            node "$scripts_dir/summarize.mjs" "$data_dir" --title "$title"
+          elif command -v docker >/dev/null 2>&1; then
+            docker run --rm --user "$(id -u):$(id -g)" \
+              -v "$data_dir":/data:ro -v "$scripts_dir":/scripts:ro \
+              node:22-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 \
+              node /scripts/summarize.mjs /data --title "$title"
+          else
+            return 1
+          fi
+        }
+        if gen_summary > "$summary" 2>/dev/null && [ -s "$summary" ]; then
           echo "summary=$summary" >> "$GITHUB_OUTPUT"
         fi
         echo "data-dir=$data_dir" >> "$GITHUB_OUTPUT"
