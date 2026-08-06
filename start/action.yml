@@ -1,32 +1,48 @@
 name: "Start Dagger trace collector"
 description: >
-  Start an OTLP collector sidecar that captures Dagger's OpenTelemetry stream
-  (spans + per-step stdout/stderr) to files, and export the
+  Start a dependency-free OTLP receiver that captures Dagger's OpenTelemetry
+  stream (spans + per-step stdout/stderr) to files, and export the
   OTEL_EXPORTER_OTLP_* variables so subsequent `dagger` steps send telemetry to
-  it. Pair with the `finish` action after your dagger steps. Requires Docker on
-  the runner.
+  it. No Docker required — it runs on the runner's own Node (the one that
+  executes JavaScript actions). Pair with the `finish` action after your dagger
+  steps.
 
 inputs:
   data-dir:
     description: >
-      Directory the collector writes traces.jsonl / logs.jsonl to. Defaults to
+      Directory the receiver writes traces.jsonl / logs.jsonl to. Defaults to
       $RUNNER_TEMP/dagger-otel; pass the SAME value to the finish action.
-    required: false
-    default: ""
-  collector-image:
-    description: >
-      Override the pinned otel/opentelemetry-collector-contrib image
-      (digest-pinned by default).
     required: false
     default: ""
 
 runs:
   using: composite
   steps:
-    - shell: bash
-      env:
-        COLLECTOR_IMAGE: ${{ inputs.collector-image }}
+    # Resolve the data dir and our sibling scripts/ dir here, where
+    # GITHUB_ACTION_PATH points at this action (a nested `uses:` step gets its
+    # own action path and couldn't).
+    - id: prep
+      shell: bash
       run: |
         data_dir="${{ inputs.data-dir }}"
         data_dir="${data_dir:-$RUNNER_TEMP/dagger-otel}"
-        "$GITHUB_ACTION_PATH/../scripts/start.sh" "$data_dir"
+        mkdir -p "$data_dir"
+        echo "data-dir=$data_dir" >> "$GITHUB_OUTPUT"
+        echo "scripts-dir=$(cd "$GITHUB_ACTION_PATH/../scripts" && pwd)" >> "$GITHUB_OUTPUT"
+
+    # Launch the receiver with the runner's own Node (process.execPath), so it
+    # works with no Node on PATH and no Docker. start.sh backgrounds it and
+    # writes the OTEL_* vars to $GITHUB_ENV; the process outlives this step.
+    - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+      env:
+        DATA_DIR: ${{ steps.prep.outputs.data-dir }}
+        SCRIPTS_DIR: ${{ steps.prep.outputs.scripts-dir }}
+      with:
+        script: |
+          const { execFileSync } = require('child_process');
+          const path = require('path');
+          execFileSync('bash', [path.join(process.env.SCRIPTS_DIR, 'start.sh'), process.env.DATA_DIR], {
+            stdio: 'inherit',
+            // Run the receiver under this same interpreter — no host Node needed.
+            env: { ...process.env, NODE: process.execPath },
+          });

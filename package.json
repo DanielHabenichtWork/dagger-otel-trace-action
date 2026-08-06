@@ -14,7 +14,7 @@
     "scripts/finish.sh",
     "scripts/bundle.sh",
     "scripts/summarize.mjs",
-    "scripts/collector-config.yaml",
+    "scripts/otlp-receiver.mjs",
     "scripts/viewer.html"
   ],
   "scripts": {

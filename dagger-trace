@@ -41,8 +41,8 @@
 #   --top N          number of slowest steps to list (default 8)
 #   --max-log-lines N  cap per-step log lines when not --full (default 40)
 #
-# Requires Docker (the collector runs as a container) and the `dagger` CLI;
-# the agent format and `report` also need `node`.
+# Requires `node` (runs the OTLP receiver that captures telemetry; no Docker)
+# and the `dagger` CLI.
 set -euo pipefail
 
 # Resolve our own location through any symlinks (npm's global bin is a symlink
@@ -124,13 +124,8 @@ if [[ "$format" == auto ]]; then
   fi
 fi
 
-if ! command -v docker >/dev/null 2>&1; then
-  echo "error: docker is required (the collector runs as a container)" >&2
-  exit 1
-fi
-
-if [[ "$format" != html && ! $(command -v node) ]]; then
-  echo "error: --format $format needs node on PATH (it renders the text summary)" >&2
+if ! command -v node >/dev/null 2>&1; then
+  echo "error: node is required (it runs the OTLP receiver that captures telemetry)" >&2
   exit 1
 fi
 
@@ -143,13 +138,15 @@ mkdir -p "$data_dir"
 # dropping it into the current working directory.
 [[ -z "$out" ]] && out="$data_dir/dagger-trace.html"
 
-name="dagger-otel-local-$$"
-cleanup() { docker rm -f "$name" >/dev/null 2>&1 || true; }
+# Start the OTLP receiver and pull the exported OTEL_* vars into this shell, so
+# the wrapped command's dagger sends its telemetry to it. start.sh writes its
+# pid to receiver.json; make sure it's killed on any exit.
+rcv_pid=""
+cleanup() { [[ -n "$rcv_pid" ]] && kill -TERM "$rcv_pid" 2>/dev/null || true; }
 trap cleanup EXIT
 
-# Start the collector and pull the exported OTEL_* vars into this shell, so the
-# wrapped command's dagger sends its telemetry to the sidecar.
-eval "$("$scripts/start.sh" "$data_dir" "$name")"
+eval "$("$scripts/start.sh" "$data_dir")"
+rcv_pid=$(grep -o '"pid":[0-9]*' "$data_dir/receiver.json" 2>/dev/null | grep -o '[0-9]*' | head -1)
 
 echo "+ ${cmd[*]}" >&2
 set +e
@@ -157,10 +154,12 @@ set +e
 status=$?
 set -e
 
-# Stop the collector gracefully so the file exporter flushes to disk before we
-# read the captured telemetry.
-docker stop "$name" >/dev/null 2>&1 || true
-docker rm "$name"   >/dev/null 2>&1 || true
+# Stop the receiver so it finishes writing before we read the captured
+# telemetry (its appends are synchronous, so this is just a clean shutdown).
+if [[ -n "$rcv_pid" ]]; then
+  kill -TERM "$rcv_pid" 2>/dev/null || true
+  for _ in $(seq 1 30); do kill -0 "$rcv_pid" 2>/dev/null || break; sleep 0.1; done
+fi
 
 # Compact text summary — printed to stdout so an agent can capture it.
 if [[ "$format" == agent || "$format" == both ]]; then
