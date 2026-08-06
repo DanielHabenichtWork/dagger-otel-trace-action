@@ -1,8 +1,11 @@
 /**
- * CI for dagger-otel-trace: Biome formatting + lint of the repo's own JS/JSON.
+ * CI for dagger-otel-trace: Biome formatting + lint of the repo's own JS/JSON,
+ * plus the Node unit tests.
  *
- * `check` is the gate (fails on any issue); `format` applies the fixes and
- * returns the updated tree. Both run Biome in a pinned node container over the
+ * `check` (Biome) and `test` (Node's test runner) are both gates — each fails
+ * the run on any issue and is registered as a Dagger check, so `dagger check`
+ * (and `dagger-trace check`) runs both. `format` applies Biome's fixes and
+ * returns the updated tree. Everything runs in a pinned node container over the
  * whole repo — Biome's own config (biome.json) scopes what gets checked.
  */
 import { dag, Container, Directory, object, func, check, argument } from "@dagger.io/dagger"
@@ -19,7 +22,18 @@ export class Ci {
   @func()
   @check()
   check(@argument({ defaultPath: "/" }) source: Directory): Container {
-    return this.biome(source).withExec(["npx", "--yes", BIOME, "check", "."])
+    return this.node(source).withExec(["npx", "--yes", BIOME, "check", "."])
+  }
+
+  /**
+   * Run the Node test suite (built-in runner). Verifies scripts/otlp-receiver.mjs
+   * decodes OTLP/protobuf into exactly the JSON the otel collector produces,
+   * against fixtures captured from a real run. Registered as a Dagger check.
+   */
+  @func()
+  @check()
+  test(@argument({ defaultPath: "/" }) source: Directory): Container {
+    return this.node(source).withExec(["node", "--test"])
   }
 
   /**
@@ -28,12 +42,12 @@ export class Ci {
    */
   @func()
   format(@argument({ defaultPath: "/" }) source: Directory): Directory {
-    return this.biome(source)
+    return this.node(source)
       .withExec(["npx", "--yes", BIOME, "check", "--write", "."])
       .directory("/src")
   }
 
-  private biome(source: Directory): Container {
+  private node(source: Directory): Container {
     return dag
       .container()
       .from("node:22-alpine")

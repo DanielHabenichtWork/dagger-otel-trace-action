@@ -18,7 +18,7 @@
     "scripts/viewer.html"
   ],
   "scripts": {
-    "test": "bash -n dagger-trace"
+    "test": "bash -n dagger-trace && node --test"
   },
   "keywords": [
     "dagger",
