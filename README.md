@@ -6,21 +6,28 @@ span waterfall, per-step stdout/stderr (ANSI-colored), error highlighting — th
 you open straight in the browser.
 
 Dagger emits OTLP for every run: each operation is a span, and each exec's
-stdout/stderr is shipped as span-linked log records. This action runs an
-[otel-collector-contrib](https://github.com/open-telemetry/opentelemetry-collector-contrib)
-sidecar on the runner to capture that stream to files, then bundles it into one
-HTML file uploaded as a workflow artifact.
+stdout/stderr is shipped as span-linked log records. This action runs a tiny
+**dependency-free OTLP receiver** (a ~300-line Node script, `scripts/otlp-receiver.mjs`)
+on the runner to capture that stream to files, then bundles it into one HTML
+file uploaded as a workflow artifact. **No Docker** — the receiver runs on the
+runner's own Node (the interpreter that executes JavaScript actions like
+`actions/github-script`), so it works even on runners without Docker or Node on
+`PATH`.
 
-Nothing is sent to any external service — the collector and the bundle stay on
+Nothing is sent to any external service — the receiver and the bundle stay on
 the runner, and the artifact is served behind your repo's normal access.
 
 ## Requirements
 
-- A runner with **Docker** (the collector runs as a container).
 - The `dagger` CLI available in the same job (e.g. via
   [`dagger/dagger-for-github`](https://github.com/dagger/dagger-for-github)).
   Dagger relays engine telemetry through the CLI, so it picks up the exported
   `OTEL_EXPORTER_OTLP_*` variables automatically.
+
+No Docker is required by this action. (Dagger itself still needs a container
+runtime for its engine — but that's Dagger's concern; if you run Dagger against
+a socket-mapped or remote engine, this action adds no Docker dependency of its
+own.)
 
 ## Usage
 
@@ -35,7 +42,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # 1. Start the collector BEFORE any dagger step. Exports OTEL_* into the
+      # 1. Start the receiver BEFORE any dagger step. Exports OTEL_* into the
       #    job env so dagger sends its telemetry here.
       - uses: DanielHabenichtWork/dagger-otel-trace-action/start@v1
         id: trace
@@ -89,7 +96,7 @@ the interpreter that already runs JavaScript actions like `actions/github-script
 ## Local CLI
 
 `dagger-trace` wraps a dagger command on your machine and produces the **same**
-self-contained viewer you get in CI — start collector, run the command, bundle,
+self-contained viewer you get in CI — start receiver, run the command, bundle,
 open. It's the same `scripts/` under the hood, so local and CI traces are
 identical.
 
@@ -133,13 +140,13 @@ summary; an interactive human gets the HTML viewer. So an agent just runs
 explicit `--format` to override the detection.
 
 Like CI's `always()`, the trace is produced even when the command fails, and
-the command's exit code is preserved. Same requirements as the actions: Docker
-(for the collector) and the `dagger` CLI on your `PATH`.
+the command's exit code is preserved. Requires `node` (runs the OTLP receiver)
+and the `dagger` CLI on your `PATH` — no Docker.
 
 | option | default | description |
 |---|---|---|
 | `--format FMT` | `auto` | `auto`, `html`, `agent`, or `both` (see below) |
-| `--data-dir DIR` | fresh `mktemp` dir | where the collector writes |
+| `--data-dir DIR` | fresh `mktemp` dir | where the receiver writes |
 | `--out FILE` | `dagger-trace.html` in the data-dir | viewer HTML path |
 | `--title TITLE` | the command line | header shown in the viewer |
 | `--serve [PORT]` | off (port `8000`) | serve over HTTP + open, instead of opening the file |
@@ -269,8 +276,7 @@ then drill in with `dagger-trace report --grep biome --full <capture-dir>`.
 
 | input | default | description |
 |---|---|---|
-| `data-dir` | `$RUNNER_TEMP/dagger-otel` | where the collector writes; must match `finish` |
-| `collector-image` | pinned contrib image | override the collector image |
+| `data-dir` | `$RUNNER_TEMP/dagger-otel` | where the receiver writes; must match `finish` |
 
 ### `finish`
 
@@ -287,24 +293,24 @@ then drill in with `dagger-trace report --grep biome --full <capture-dir>`.
 
 ## Notes
 
-- **Concurrency:** the collector binds a random host port and names its
-  container per run+attempt, so multiple jobs can capture on one runner.
+- **Concurrency:** the receiver binds a random loopback port and writes to its
+  own `data-dir`, so multiple jobs can capture on one runner (give each a
+  distinct `data-dir`/`artifact-name`).
 - **Logs need the explicit endpoint:** Dagger only ships the stdout/stderr log
   stream when `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set (the `start` action does
   this for you).
 - **Standalone viewer:** open `scripts/viewer.html` directly and drag-and-drop
-  raw collector `traces.jsonl` / `logs.jsonl` (or `.gz`) — parsed locally, never
-  uploaded.
+  raw `traces.jsonl` / `logs.jsonl` (or `.gz`) — parsed locally, never uploaded.
 
 ## Layout
 
 ```
 dagger-trace        local CLI: wrap a dagger command, capture, bundle, open
 package.json        npm manifest (installs the dagger-trace bin globally)
-start/action.yml    composite: run collector, export OTEL_* env
-finish/action.yml   composite: stop collector, bundle HTML, upload, PR comment
-scripts/            start.sh, finish.sh, bundle.sh, summarize.mjs,
-                    collector-config.yaml, viewer.html
+start/action.yml    composite: launch OTLP receiver, export OTEL_* env
+finish/action.yml   composite: stop receiver, bundle HTML, upload, PR comment
+scripts/            start.sh, finish.sh, bundle.sh, otlp-receiver.mjs,
+                    summarize.mjs, viewer.html
 dagger.json         Dagger module config (source: .dagger)
 .dagger/            Dagger CI module: `check` (biome) / `format` over the repo
 biome.json          Biome config (scopes the repo's JS/JSON)

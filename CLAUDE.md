@@ -9,10 +9,10 @@ A GitHub composite action, in two halves, that captures Dagger's OpenTelemetry
 stream on the runner (no Dagger Cloud) and turns it into a single self-contained
 HTML trace viewer uploaded as a workflow artifact.
 
-- **`start/`** — runs an `otel/opentelemetry-collector-contrib` sidecar and
+- **`start/`** — launches the OTLP receiver (`scripts/otlp-receiver.mjs`) and
   exports `OTEL_EXPORTER_OTLP_*` into the job env; drop it *before* the dagger
-  steps.
-- **`finish/`** — stops the collector, bundles the captured telemetry into one
+  steps. **No Docker** — the receiver runs on the runner's own Node.
+- **`finish/`** — stops the receiver, bundles the captured telemetry into one
   HTML file, uploads it non-zipped, and (on PRs) upserts a comment + writes a
   job-summary link; run it `if: always()` *after* the dagger steps.
 
@@ -21,7 +21,7 @@ Everything stays on the runner. Nothing is sent to an external service.
 ## Data flow
 
 ```
-dagger step ──OTLP──> collector sidecar ──file exporter──> <data-dir>/{traces,logs}.jsonl
+dagger step ──OTLP/protobuf──> otlp-receiver.mjs (Node) ──> <data-dir>/{traces,logs}.jsonl
                                                                   │
                                           bundle.sh: gzip + base64-embed into viewer.html
                                                                   │
@@ -30,8 +30,17 @@ dagger step ──OTLP──> collector sidecar ──file exporter──> <data
                                     upload-artifact (archive:false) → job summary + PR comment
 ```
 
-- The collector listens on a **random host port** (concurrent jobs on one runner
-  don't collide) and its container is named per run+attempt.
+- **No Docker (v1.5+).** Capture was originally an `otel-collector-contrib`
+  container; it's now `scripts/otlp-receiver.mjs`, a dependency-free Node HTTP
+  server that decodes OTLP/protobuf into the *exact* OTLP-JSON the collector's
+  file exporter wrote (so viewer/summarize are unchanged). In CI it's launched
+  with the runner's own Node via `process.execPath` (see `start/action.yml`), so
+  no Node-on-PATH or Docker is needed. Correctness is pinned by
+  `test/otlp-receiver.test.mjs` against fixtures captured from the real
+  collector — don't change the decode output shape without updating/rerunning it.
+- The receiver binds a **random loopback port** (concurrent jobs on one runner
+  don't collide, given distinct `data-dir`s) and writes `receiver.json`
+  (`{port,pid}`); `finish` stops it by pid.
 - Dagger only ships the **stdout/stderr log stream** when
   `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set explicitly — `start.sh` sets both the
   generic endpoint and the signal-specific logs endpoint. With only the generic
@@ -45,12 +54,13 @@ dagger step ──OTLP──> collector sidecar ──file exporter──> <data
 
 | File | Role |
 |---|---|
-| `start/action.yml` | composite wrapper → `scripts/start.sh` |
+| `start/action.yml` | composite: resolve dirs, then a `github-script` step runs `scripts/start.sh` under the runner's Node (`process.execPath`) |
 | `finish/action.yml` | composite: build `meta.json`, `scripts/finish.sh`, `upload-artifact`, `github-script` (summary + PR comment) |
-| `scripts/start.sh` | run the collector container; print/export `OTEL_*`; readiness-poll |
-| `scripts/finish.sh` | stop+remove the collector; call `bundle.sh` |
+| `scripts/otlp-receiver.mjs` | dependency-free Node OTLP/HTTP receiver: decode OTLP/protobuf → collector-shaped `{traces,logs}.jsonl`; also the capture "server" |
+| `scripts/start.sh` | background the receiver (`${NODE:-node}`); print/export `OTEL_*`; readiness-poll on `receiver.json` |
+| `scripts/finish.sh` | stop the receiver (SIGTERM by pid from `receiver.json`); call `bundle.sh` |
 | `scripts/bundle.sh` | gzip+base64-embed `traces.jsonl`/`logs.jsonl`/`meta.json` into `viewer.html` at the `<!--__DAGGER_TRACE_DATA__-->` marker |
-| `scripts/collector-config.yaml` | otlp receiver → file exporter (`/data/*.jsonl`) |
+| `test/otlp-receiver.test.mjs` | `node:test` harness: receiver output == collector output, against `test/fixtures/` (run by `dagger check`'s `test`) |
 | `scripts/viewer.html` | the entire viewer — **where almost all real work happens** |
 
 Composite steps reference sibling scripts via `$GITHUB_ACTION_PATH/../scripts/`
@@ -64,7 +74,7 @@ that way. Rough map (line numbers drift; grep for the names):
 - **Data load** — `bundle.sh` injects `<script type="text/plain" id="data-traces|data-logs">`
   (gzip+base64) and `id="data-meta"` (JSON). The page gunzips them with the
   browser-native `DecompressionStream("gzip")`. It also accepts **drag-and-drop**
-  of raw collector `.jsonl`/`.gz` when opened standalone.
+  of raw `.jsonl`/`.gz` (receiver or collector output) when opened standalone.
 - **`attrVal` / `attrsToObj`** — OTLP attribute → JS value (handles every OTLP
   value type; don't regress that).
 - **dag.call decoding** (`pbScan`, `decodeLiteral`, `decodeList`, `decodeDagCall`,
@@ -101,10 +111,10 @@ The scripts work outside CI. Capture a real trace from any Dagger module, then
 bundle and eyeball it:
 
 ```bash
-# 1. capture (needs Docker + the dagger CLI)
+# 1. capture (needs node + the dagger CLI; no Docker)
 eval "$(scripts/start.sh /tmp/otel)"
 dagger check           # or any dagger call, in a repo with a module
-scripts/finish.sh /tmp/otel /tmp/trace.html   # stops collector + bundles
+scripts/finish.sh /tmp/otel /tmp/trace.html   # stops the receiver + bundles
 
 # 2. open /tmp/trace.html in a browser
 ```
@@ -151,8 +161,10 @@ Checks worth running after editing `viewer.html`:
 - **Commit author** is a GitHub noreply address, not a personal/corporate email.
 - **No dependencies in the viewer** — vanilla JS only.
 - Trace/telemetry steps must **never fail the build** — the action is used with
-  `continue-on-error: true` and the finish step gated on the collector having
+  `continue-on-error: true` and the finish step gated on the receiver having
   started.
+- **No dependencies anywhere** — the receiver, summarizer, and viewer are all
+  vanilla Node/JS with zero npm deps; keep it that way.
 
 ## Known limitation (not a bug here)
 

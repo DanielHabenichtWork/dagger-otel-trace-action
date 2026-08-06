@@ -1,42 +1,40 @@
 #!/usr/bin/env bash
-# Start an OTLP collector container that captures Dagger telemetry to files.
+# Launch the dependency-free OTLP receiver (scripts/otlp-receiver.mjs) that
+# captures Dagger's OpenTelemetry stream to <data-dir>/{traces,logs}.jsonl.
+# No Docker — just Node. Prints `export OTEL_...` lines on stdout (for local
+# use: eval "$(start.sh /tmp/otel)") and appends the same to $GITHUB_ENV in CI.
 #
-# usage: start.sh <data-dir> [container-name]
+# usage: start.sh <data-dir>
 #
-# Prints `export OTEL_...` lines on stdout (for local use: eval "$(start.sh /tmp/otel)"),
-# and appends the same variables to $GITHUB_ENV when running in GitHub Actions.
-# Host ports are assigned randomly so concurrent jobs on one runner don't collide.
+# The receiver binds a random loopback port (concurrent jobs don't collide),
+# writes {port,pid} to <data-dir>/receiver.json, and runs in the background;
+# finish.sh stops it (by pid) to flush and bundle. Set NODE to override the
+# node binary (CI passes the runner's own Node so no host install is needed).
 set -euo pipefail
 
 data_dir=$1
-name=${2:-dagger-otel-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}}
 dir=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
-# Override with COLLECTOR_IMAGE if set (the action's collector-image input).
-image="${COLLECTOR_IMAGE:-otel/opentelemetry-collector-contrib:0.156.0@sha256:125bdbeb7590cc1952c5b3430ecf14063568980c2c93d5b38676cc0446ed8108}"
+node_bin=${NODE:-node}
 
 mkdir -p "$data_dir"
-docker rm -f "$name" >/dev/null 2>&1 || true
-docker run -d --name "$name" \
-  --user "$(id -u)" \
-  -p 127.0.0.1::4318 \
-  -v "$dir/collector-config.yaml":/etc/otelcol-contrib/config.yaml:ro \
-  -v "$data_dir":/data \
-  "$image" >/dev/null
+rm -f "$data_dir/receiver.json"
 
-port=$(docker port "$name" 4318/tcp | head -1 | sed 's/.*://')
-endpoint="http://127.0.0.1:$port"
+# Detach fully so the receiver outlives this shell (and, in CI, this step).
+nohup "$node_bin" "$dir/otlp-receiver.mjs" "$data_dir" >"$data_dir/receiver.log" 2>&1 &
+disown 2>/dev/null || true
 
-for _ in $(seq 1 50); do
-  code=$(curl -s -o /dev/null -w '%{http_code}' "$endpoint" || true)
-  [[ "$code" != "000" ]] && break
-  sleep 0.2
+for _ in $(seq 1 100); do
+  [[ -s "$data_dir/receiver.json" ]] && break
+  sleep 0.1
 done
-if [[ "${code:-000}" == "000" ]]; then
-  echo "error: collector did not become ready on $endpoint" >&2
-  docker logs "$name" >&2 || true
+port=$(grep -o '"port":[0-9]*' "$data_dir/receiver.json" 2>/dev/null | grep -o '[0-9]*' | head -1)
+if [[ -z "${port:-}" ]]; then
+  echo "error: OTLP receiver did not start" >&2
+  cat "$data_dir/receiver.log" >&2 2>/dev/null || true
   exit 1
 fi
-echo "collector '$name' listening on $endpoint, writing to $data_dir" >&2
+endpoint="http://127.0.0.1:$port"
+echo "OTLP receiver listening on $endpoint, writing to $data_dir" >&2
 
 # Dagger only ships the log stream (per-exec stdout/stderr) when the
 # logs endpoint is set explicitly, so set the signal-specific vars too.
