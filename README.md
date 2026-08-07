@@ -299,6 +299,13 @@ then drill in with `dagger-trace report --grep biome --full <capture-dir>`.
 - **Logs need the explicit endpoint:** Dagger only ships the stdout/stderr log
   stream when `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set (the `start` action does
   this for you).
+- **Forwards to your existing collector:** if an OTLP endpoint is already
+  exported in the job (`OTEL_EXPORTER_OTLP_ENDPOINT`, or the signal-specific
+  `..._TRACES_ENDPOINT` / `..._LOGS_ENDPOINT`), `start` reads it before pointing
+  Dagger at the local receiver and tees an untouched copy of the telemetry there
+  too — with your `OTEL_EXPORTER_OTLP_HEADERS` (auth) attached. Forwarding is
+  best-effort over HTTP/protobuf (it never fails the build); a gRPC endpoint
+  can't accept Dagger's bytes, so it's skipped with a note.
 - **Standalone viewer:** open `scripts/viewer.html` directly and drag-and-drop
   raw `traces.jsonl` / `logs.jsonl` (or `.gz`) — parsed locally, never uploaded.
 

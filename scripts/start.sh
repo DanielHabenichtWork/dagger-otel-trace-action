@@ -19,8 +19,40 @@ node_bin=${NODE:-node}
 mkdir -p "$data_dir"
 rm -f "$data_dir/receiver.json"
 
+# Honour any OTLP endpoint the runner already exported: tee a copy of the
+# captured telemetry there too. Resolve per-signal upstream URLs per the OTLP
+# env-var spec — a signal-specific endpoint is used verbatim; the generic one
+# gets /v1/<signal> appended. Read these now, before we point Dagger at our own
+# loopback receiver below (we only mutate $GITHUB_ENV, not this shell's env, so
+# the originals are still visible). The receiver forwards over HTTP/protobuf, so
+# skip a gRPC upstream — it can't accept the bytes Dagger emits.
+resolve_fwd() {
+  local specific=$1 generic=$2 path=$3 proto=$4
+  case "${proto:-}" in
+    grpc | *grpc*)
+      echo "note: OTLP protocol '$proto' is gRPC; not forwarding $path (receiver is HTTP/protobuf)" >&2
+      return
+      ;;
+  esac
+  if [[ -n "$specific" ]]; then
+    echo "$specific"
+  elif [[ -n "$generic" ]]; then
+    echo "${generic%/}$path"
+  fi
+}
+fwd_traces=$(resolve_fwd "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}" "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" /v1/traces \
+  "${OTEL_EXPORTER_OTLP_TRACES_PROTOCOL:-${OTEL_EXPORTER_OTLP_PROTOCOL:-}}")
+fwd_logs=$(resolve_fwd "${OTEL_EXPORTER_OTLP_LOGS_ENDPOINT:-}" "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" /v1/logs \
+  "${OTEL_EXPORTER_OTLP_LOGS_PROTOCOL:-${OTEL_EXPORTER_OTLP_PROTOCOL:-}}")
+fwd_traces_headers="${OTEL_EXPORTER_OTLP_TRACES_HEADERS:-${OTEL_EXPORTER_OTLP_HEADERS:-}}"
+fwd_logs_headers="${OTEL_EXPORTER_OTLP_LOGS_HEADERS:-${OTEL_EXPORTER_OTLP_HEADERS:-}}"
+[[ -n "$fwd_traces" ]] && echo "forwarding a copy of traces to $fwd_traces" >&2
+[[ -n "$fwd_logs" ]] && echo "forwarding a copy of logs to $fwd_logs" >&2
+
 # Detach fully so the receiver outlives this shell (and, in CI, this step).
-nohup "$node_bin" "$dir/otlp-receiver.mjs" "$data_dir" >"$data_dir/receiver.log" 2>&1 &
+FORWARD_TRACES="$fwd_traces" FORWARD_LOGS="$fwd_logs" \
+  FORWARD_TRACES_HEADERS="$fwd_traces_headers" FORWARD_LOGS_HEADERS="$fwd_logs_headers" \
+  nohup "$node_bin" "$dir/otlp-receiver.mjs" "$data_dir" >"$data_dir/receiver.log" 2>&1 &
 disown 2>/dev/null || true
 
 for _ in $(seq 1 100); do

@@ -45,6 +45,18 @@ dagger step ──OTLP/protobuf──> otlp-receiver.mjs (Node) ──> <data-di
   `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set explicitly — `start.sh` sets both the
   generic endpoint and the signal-specific logs endpoint. With only the generic
   one you get spans but no output. (Learned empirically; don't "simplify" it away.)
+- **Pass-through to a pre-existing collector.** `start.sh` reads any OTLP
+  endpoint already in the job env (`OTEL_EXPORTER_OTLP_ENDPOINT`, or the
+  signal-specific `..._TRACES/LOGS_ENDPOINT`) *before* it overwrites those vars
+  with our loopback receiver, resolves per-signal upstream URLs (OTLP spec rule:
+  signal-specific verbatim, generic gets `/v1/<signal>`), and passes them +
+  `OTEL_EXPORTER_OTLP_HEADERS` to the receiver as `FORWARD_{TRACES,LOGS}[_HEADERS]`.
+  The receiver tees the **raw request bytes verbatim** (same content-type/encoding
+  the SDK sent — no re-encode) to that upstream, best-effort: forward errors only
+  hit stderr, never the local capture or the 200 owed to Dagger. Forwarding is
+  HTTP/protobuf only; a `grpc` protocol upstream is skipped with a note (the
+  receiver can't speak gRPC). Reading env still works because `start.sh` only
+  appends our vars to `$GITHUB_ENV`, not this shell's env.
 - `upload-artifact` runs with **`archive: false`** (v7+) so the artifact is the
   bare `.html`, served `text/html` + `inline` from GitHub's blob domain and thus
   rendered in-browser (no zip, no download step). Only one file may be uploaded
@@ -57,7 +69,7 @@ dagger step ──OTLP/protobuf──> otlp-receiver.mjs (Node) ──> <data-di
 | `start/action.yml` | composite: resolve dirs, then a `github-script` step runs `scripts/start.sh` under the runner's Node (`process.execPath`) |
 | `finish/action.yml` | composite: build `meta.json`, `scripts/finish.sh`, `upload-artifact`, `github-script` (summary + PR comment) |
 | `scripts/otlp-receiver.mjs` | dependency-free Node OTLP/HTTP receiver: decode OTLP/protobuf → collector-shaped `{traces,logs}.jsonl`; also the capture "server" |
-| `scripts/start.sh` | background the receiver (`${NODE:-node}`); print/export `OTEL_*`; readiness-poll on `receiver.json` |
+| `scripts/start.sh` | resolve any pre-existing OTLP endpoint into `FORWARD_*`; background the receiver (`${NODE:-node}`); print/export `OTEL_*`; readiness-poll on `receiver.json` |
 | `scripts/finish.sh` | stop the receiver (SIGTERM by pid from `receiver.json`); call `bundle.sh` |
 | `scripts/bundle.sh` | gzip+base64-embed `traces.jsonl`/`logs.jsonl`/`meta.json` into `viewer.html` at the `<!--__DAGGER_TRACE_DATA__-->` marker |
 | `test/otlp-receiver.test.mjs` | `node:test` harness: receiver output == collector output, against `test/fixtures/` (run by `dagger check`'s `test`) |

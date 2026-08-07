@@ -17,7 +17,8 @@ import { fileURLToPath } from "node:url";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
-import { decodeTraces, decodeLogs, inflate, startServer } from "../scripts/otlp-receiver.mjs";
+import http from "node:http";
+import { decodeTraces, decodeLogs, inflate, startServer, parseOtlpHeaders } from "../scripts/otlp-receiver.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const fx = join(here, "fixtures", "dagger-check");
@@ -88,6 +89,70 @@ test("end-to-end: summarize output is identical to the collector's", () => {
   }
   const run = (d) => execFileSync(process.execPath, [summarize, d, "--title", "t"], { encoding: "utf8" });
   assert.equal(run(dir), run(join(fx, "expected")), "summary from receiver != summary from collector");
+});
+
+test("parseOtlpHeaders: comma-separated, percent-decoded key=value pairs", () => {
+  assert.deepEqual(parseOtlpHeaders("authorization=Bearer%20xyz,x-tenant=acme"), {
+    authorization: "Bearer xyz",
+    "x-tenant": "acme",
+  });
+  assert.deepEqual(parseOtlpHeaders(""), {});
+  assert.deepEqual(parseOtlpHeaders(undefined), {});
+});
+
+test("forward: tees the raw bytes + headers upstream while still capturing locally", async () => {
+  // Sink standing in for the runner's pre-existing OTLP endpoint.
+  const received = [];
+  const sink = http.createServer((req, res) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => {
+      received.push({ path: req.url, headers: req.headers, body: Buffer.concat(chunks) });
+      res.writeHead(200);
+      res.end();
+    });
+  });
+  sink.listen(0, "127.0.0.1");
+  await new Promise((r) => sink.once("listening", r));
+  const sinkPort = sink.address().port;
+
+  const dir = mkdtempSync(join(tmpdir(), "otlp-fwd-"));
+  const server = startServer({
+    dataDir: dir,
+    forward: {
+      traces: { url: `http://127.0.0.1:${sinkPort}/v1/traces`, headers: { authorization: "Bearer t" } },
+      logs: { url: `http://127.0.0.1:${sinkPort}/v1/logs`, headers: {} },
+    },
+  });
+  await new Promise((r) => server.once("listening", r));
+  const port = server.address().port;
+
+  const raw = readReq(reqFiles("traces")[0]);
+  try {
+    const res = await fetch(`http://127.0.0.1:${port}/v1/traces`, {
+      method: "POST",
+      headers: { "content-type": "application/x-protobuf" },
+      body: raw,
+    });
+    assert.equal(res.status, 200, "Dagger still gets its 200 regardless of the tee");
+    // Forwarding is fire-and-forget; give the sink a moment to receive it.
+    for (let i = 0; i < 50 && received.length === 0; i++) await new Promise((r) => setTimeout(r, 10));
+  } finally {
+    await new Promise((r) => server.close(r));
+    await new Promise((r) => sink.close(r));
+  }
+
+  assert.equal(received.length, 1, "upstream received exactly one forwarded batch");
+  const fwd = received[0];
+  assert.equal(fwd.path, "/v1/traces");
+  assert.deepEqual(fwd.body, raw, "bytes are forwarded verbatim");
+  assert.equal(fwd.headers["content-type"], "application/x-protobuf");
+  assert.equal(fwd.headers.authorization, "Bearer t", "configured auth header is attached");
+
+  // The local capture is unaffected by forwarding.
+  const local = readFileSync(join(dir, "traces.jsonl"), "utf8").split("\n").filter(Boolean);
+  assert.equal(local.length, 1, "still captured locally");
+  assert.deepEqual(canon(JSON.parse(local[0])), canon(decodeTraces(raw)));
 });
 
 test("live server: POSTing the request bodies reproduces the collector output", async () => {

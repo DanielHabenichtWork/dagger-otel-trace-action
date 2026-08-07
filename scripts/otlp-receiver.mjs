@@ -20,6 +20,7 @@ import { appendFileSync, mkdirSync, writeFileSync } from "node:fs";
 // <data-dir>/receiver.json, and flushes + exits on SIGTERM. Writes are
 // synchronous appends, so the files are durable without an explicit flush.
 import http from "node:http";
+import https from "node:https";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import zlib from "node:zlib";
@@ -371,7 +372,62 @@ export function inflate(body, contentEncoding) {
   return body;
 }
 
-export function startServer({ dataDir, port = 0, host = "127.0.0.1" }) {
+// Parse an OTLP headers env value (comma-separated, percent-encoded key=value
+// pairs, per the OTEL_EXPORTER_OTLP_HEADERS spec) into an HTTP header object.
+export function parseOtlpHeaders(raw) {
+  const out = {};
+  if (!raw) return out;
+  for (const pair of raw.split(",")) {
+    const eq = pair.indexOf("=");
+    if (eq < 0) continue;
+    const key = pair.slice(0, eq).trim();
+    if (!key) continue;
+    const val = pair.slice(eq + 1).trim();
+    try {
+      out[key] = decodeURIComponent(val);
+    } catch {
+      out[key] = val;
+    }
+  }
+  return out;
+}
+
+// Tee the raw export bytes to an upstream endpoint the runner already
+// configured. Best-effort: verbatim passthrough (same content-type/encoding as
+// Dagger sent), never throws, only ever logs to stderr — so a broken or slow
+// upstream can't affect the local capture or the 200 we owe Dagger.
+function forwardBatch(target, body, srcHeaders) {
+  try {
+    const url = new URL(target.url);
+    const mod = url.protocol === "https:" ? https : http;
+    const headers = {
+      "content-type": srcHeaders["content-type"] || "application/x-protobuf",
+      "content-length": body.length,
+      ...target.headers,
+    };
+    if (srcHeaders["content-encoding"])
+      headers["content-encoding"] = srcHeaders["content-encoding"];
+    const req = mod.request(
+      {
+        protocol: url.protocol,
+        hostname: url.hostname,
+        port: url.port,
+        path: `${url.pathname}${url.search}`,
+        method: "POST",
+        headers,
+      },
+      (res) => res.resume(),
+    );
+    req.on("error", (e) =>
+      process.stderr.write(`otlp-receiver: forward to ${target.url} failed: ${e.message}\n`),
+    );
+    req.end(body);
+  } catch (e) {
+    process.stderr.write(`otlp-receiver: forward error: ${e.message}\n`);
+  }
+}
+
+export function startServer({ dataDir, port = 0, host = "127.0.0.1", forward = {} }) {
   mkdirSync(dataDir, { recursive: true });
   const files = {
     traces: join(dataDir, "traces.jsonl"),
@@ -381,15 +437,18 @@ export function startServer({ dataDir, port = 0, host = "127.0.0.1" }) {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
-      try {
-        const m = (req.url || "").match(/\/v1\/(traces|logs|metrics)/);
-        if (m && m[1] !== "metrics") {
-          const body = inflate(Buffer.concat(chunks), req.headers["content-encoding"]);
+      const raw = Buffer.concat(chunks);
+      const m = (req.url || "").match(/\/v1\/(traces|logs|metrics)/);
+      if (m && m[1] !== "metrics") {
+        // Forward the untouched bytes first so a decode bug can't drop the tee.
+        if (forward[m[1]]) forwardBatch(forward[m[1]], raw, req.headers);
+        try {
+          const body = inflate(raw, req.headers["content-encoding"]);
           const batch = m[1] === "traces" ? decodeTraces(body) : decodeLogs(body);
           appendFileSync(files[m[1]], `${JSON.stringify(batch)}\n`);
+        } catch (e) {
+          process.stderr.write(`otlp-receiver: decode error: ${e.stack || e}\n`);
         }
-      } catch (e) {
-        process.stderr.write(`otlp-receiver: decode error: ${e.stack || e}\n`);
       }
       // Minimal OTLP success: 200 with an empty body is accepted by the SDK.
       res.writeHead(200, { "content-type": "application/x-protobuf" });
@@ -423,12 +482,28 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.stderr.write("usage: otlp-receiver.mjs <data-dir> [--port N]\n");
     process.exit(2);
   }
-  const server = startServer({ dataDir, port, host });
+  // FORWARD_{TRACES,LOGS}[_HEADERS] are resolved by start.sh from any OTLP
+  // endpoint the runner already exported — tee a copy of the capture there too.
+  const forward = {};
+  for (const sig of ["traces", "logs"]) {
+    const url = process.env[`FORWARD_${sig.toUpperCase()}`];
+    if (url) {
+      forward[sig] = {
+        url,
+        headers: parseOtlpHeaders(process.env[`FORWARD_${sig.toUpperCase()}_HEADERS`]),
+      };
+    }
+  }
+  const server = startServer({ dataDir, port, host, forward });
   server.on("listening", () => {
     const info = { port: server.address().port, pid: process.pid };
     info.endpoint = `http://${host}:${info.port}`;
     writeFileSync(join(dataDir, "receiver.json"), JSON.stringify(info));
     process.stderr.write(`otlp-receiver on ${info.endpoint} (pid ${info.pid})\n`);
+    for (const sig of ["traces", "logs"]) {
+      if (forward[sig])
+        process.stderr.write(`otlp-receiver: forwarding ${sig} to ${forward[sig].url}\n`);
+    }
     process.stdout.write(`${JSON.stringify(info)}\n`);
   });
   server.on("error", (e) => {
