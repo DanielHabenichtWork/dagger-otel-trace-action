@@ -116,6 +116,7 @@
 <body>
 <header>
   <h1>Dagger trace</h1>
+  <span class="meta"><a id="viewer-source" href="https://github.com/DanielHabenichtWork/dagger-otel-trace-action">GitHub</a></span>
   <span class="meta" id="meta"></span>
 </header>
 <div id="summary" hidden></div>
@@ -955,17 +956,49 @@ function loadError(e) {
   el.textContent = "Failed to load trace data: " + (e && e.message || e);
 }
 
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : "";
+  } catch (e) {
+    return "";
+  }
+}
+function pathPart(value) {
+  return String(value).split("/").map(encodeURIComponent).join("/");
+}
+function metaLink(label, url) {
+  const safe = safeHttpUrl(url);
+  return safe ? `<a href="${esc(safe)}">${esc(String(label))}</a>` : esc(String(label));
+}
+function metaHtml(m) {
+  let repoUrl = safeHttpUrl(m.repoUrl);
+  if (!repoUrl && m.repo && String(m.repo).includes("/")) {
+    let origin = "https://github.com";
+    try { if (m.runUrl) origin = new URL(m.runUrl).origin; } catch (e) { /* use github.com */ }
+    repoUrl = safeHttpUrl(`${origin}/${pathPart(m.repo)}`);
+  }
+  repoUrl = repoUrl.replace(/\/$/, "");
+
+  const parts = [];
+  if (m.repo) parts.push(metaLink(m.repo, repoUrl));
+  if (m.ref) parts.push(metaLink(m.ref, repoUrl && `${repoUrl}/tree/${pathPart(m.ref)}`));
+  if (m.sha) parts.push(metaLink(String(m.sha).slice(0, 10), repoUrl && `${repoUrl}/commit/${encodeURIComponent(m.sha)}`));
+  if (m.date) parts.push(esc(String(m.date)));
+  if (m.runUrl) parts.push(metaLink("workflow run", m.runUrl));
+  return parts.join(" · ");
+}
 function applyMeta(m) {
   document.title = `Dagger trace — ${m.title || ""}`;
-  document.getElementById("meta").innerHTML =
-    [m.repo && esc(m.repo), m.ref && esc(m.ref), m.sha && esc(m.sha.slice(0, 10)), m.date && esc(m.date)].filter(Boolean).join(" · ") +
-    (m.runUrl ? ` · <a href="${esc(m.runUrl)}">workflow run</a>` : "");
+  document.getElementById("meta").innerHTML = metaHtml(m);
 }
 function ingestBatches(batches) {
   for (const b of batches) if (b.__meta__) applyMeta(b.__meta__);
   autoDetectIngest(batches);
 }
 async function loadEmbedded() {
+  const versionEl = document.getElementById("data-viewer-version");
+  if (versionEl) document.getElementById("viewer-source").textContent = `v${versionEl.textContent.trim()} · GitHub`;
   const metaEl = document.getElementById("data-meta");
   if (metaEl) {
     try { applyMeta(JSON.parse(metaEl.textContent)); } catch (e) { /* meta is optional */ }
