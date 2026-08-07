@@ -33,7 +33,9 @@ export class Ci {
   @func()
   @check()
   test(@argument({ defaultPath: "/" }) source: Directory): Container {
-    return this.node(source).withExec(["node", "--test"])
+    return this.node(source)
+      .withExec(["apk", "add", "--no-cache", "bash"])
+      .withExec(["npm", "test"])
   }
 
   /**
