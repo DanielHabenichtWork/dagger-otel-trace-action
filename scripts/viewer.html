@@ -1072,16 +1072,20 @@ function gPath(n, memo) {
   if (memo.has(n)) return memo.get(n);
   memo.set(n, null); // cycle guard
   let p = null;
+  n.fromHost = false; // does this path trace back to a Host filesync read (= a real repo file)?
   const name = n.span.name || "", by = gArgs(n);
   if (/^Host\./.test(name)) {
     p = "";
+    n.fromHost = true;
   } else if (by.path != null) {
     const raw = String(by.path);
-    if (raw.startsWith("/")) p = raw;
+    if (raw.startsWith("/")) p = raw; // absolute container path
     else {
       // inherit the base from a directory input only — a file can't be a parent,
-      // so withNewFile/withFile siblings don't nest under each other.
-      const base = n.rin.map(i => i.kind === "file" && gIsDir(i) ? gPath(i, memo) : null).find(x => x != null);
+      // so withNewFile/withFile siblings don't nest under each other. Carry the
+      // host provenance along with the base path.
+      let base = null;
+      for (const i of n.rin) if (i.kind === "file" && gIsDir(i)) { const bp = gPath(i, memo); if (bp != null) { base = bp; n.fromHost = i.fromHost; break; } }
       const rel = raw.replace(/^\.\//, "");
       p = base == null ? rel : base === "" ? rel : base + "/" + rel;
     }
@@ -1095,6 +1099,21 @@ function gGroup(n) {
   let s = n.span;
   while (s) { if (s.checkName) return s.checkName; s = s.parent ? state.spans.get(s.parent) : null; }
   return "";
+}
+// Module/SDK bootstrap: the work Dagger does to *load* the module (generate the
+// SDK client, build the runtime container, install deps, introspect typedefs) —
+// machinery, not the user's pipeline. Detected by an ancestor span named for a
+// load phase; these span names are stable across SDK languages. Spliced out by
+// default (revealed by "raw ops"), which removes the client.gen.ts / telemetry.ts
+// / codegen / ts-introspector clutter.
+// NB: match "load SDK:" / "module SDK" / "load sdk runtime" / "install
+// dependencies" but NOT the top-level "load module: <name>", which wraps the
+// whole run (checks included) — matching it would hide everything.
+const GRAPH_BOOTSTRAP_ANCESTORS = [/^load sdk\b/i, /^module sdk\b/i, /^install dependencies\b/i];
+function gBootstrap(n) {
+  let s = n.span;
+  while (s) { if (GRAPH_BOOTSTRAP_ANCESTORS.some(r => r.test(s.name || ""))) return true; s = s.parent ? state.spans.get(s.parent) : null; }
+  return false;
 }
 
 // ---- filesystem tree from the reconstructed paths (merges shared folders) ----
@@ -1149,7 +1168,13 @@ function buildGraph() {
   for (const n of all) if (n.kind === "file") { n.props = new Set(); n.path = gPath(n, pmemo); }
   // property ops fold onto their file input; property + plumbing ops are spliced
   for (const n of all) if (n.kind === "op" && GRAPH_PROP_OPS.has(n.op)) n.kind = "prop";
-  for (const n of all) n.hidden = !raw && (n.kind === "prop" || (n.kind === "op" && GRAPH_HIDE_OPS.has(n.op)));
+  // Hide plumbing + module/SDK bootstrap by default. Bootstrap keeps real repo
+  // files (Host-sourced) so the tree still shows what the pipeline reads; it only
+  // drops the generated SDK stubs (client.gen.ts, telemetry.ts, …) and machinery.
+  for (const n of all) n.hidden = !raw && (
+    n.kind === "prop" ||
+    (n.kind === "op" && GRAPH_HIDE_OPS.has(n.op)) ||
+    (gBootstrap(n) && !(n.kind === "file" && n.fromHost)));
   if (!raw) for (const n of all) if (n.kind === "prop") {
     const fin = n.rin.find(i => i.kind === "file");
     if (fin) fin.props.add(n.op);
