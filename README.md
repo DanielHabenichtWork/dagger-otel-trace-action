@@ -2,14 +2,16 @@
 
 Capture [Dagger](https://dagger.io)'s OpenTelemetry stream in CI **without
 Dagger Cloud**, and turn it into a single self-contained HTML trace viewer —
-span waterfall, per-step stdout/stderr (ANSI-colored), error highlighting — that
-you open straight in the browser.
+span waterfall, per-step stdout/stderr (ANSI-colored), per-exec resource usage
+(CPU / network / IO), error highlighting — that you open straight in the browser.
 
-Dagger emits OTLP for every run: each operation is a span, and each exec's
-stdout/stderr is shipped as span-linked log records. This action runs a tiny
-**dependency-free OTLP receiver** (a ~300-line Node script, `scripts/otlp-receiver.mjs`)
-on the runner to capture that stream to files, then bundles it into one HTML
-file uploaded as a workflow artifact. **No Docker** — the receiver runs on the
+Dagger emits OTLP for every run: each operation is a span, each exec's
+stdout/stderr is shipped as span-linked log records, and the engine reports
+per-exec resource-usage **metrics** (CPU time, network bytes, IO pressure). This
+action runs a tiny **dependency-free OTLP receiver** (a ~300-line Node script,
+`scripts/otlp-receiver.mjs`) on the runner to capture all three signals to
+files, then bundles them into one HTML file uploaded as a workflow artifact.
+**No Docker** — the receiver runs on the
 runner's own Node (the interpreter that executes JavaScript actions like
 `actions/github-script`), so it works even on runners without Docker or Node on
 `PATH`.
@@ -73,7 +75,8 @@ line-numbered logs, the span tree) inline in the job summary and PR comment,
 behind a `<details>` so humans still see just the link. So an agent reviewing a
 PR or a failed run gets the triage view with no download and no HTML to parse.
 It additionally uploads a second `<artifact-name>-raw` artifact holding the raw
-collector capture (`traces.jsonl` / `logs.jsonl`) plus the summary. The inline
+collector capture (`traces.jsonl` / `logs.jsonl` / `metrics.jsonl`) plus the
+summary. The inline
 `<details>` **links that raw artifact and shows the exact commands to drill in**
 — no run id to look up:
 
@@ -296,18 +299,25 @@ then drill in with `dagger-trace report --grep biome --full <capture-dir>`.
 - **Concurrency:** the receiver binds a random loopback port and writes to its
   own `data-dir`, so multiple jobs can capture on one runner (give each a
   distinct `data-dir`/`artifact-name`).
-- **Logs need the explicit endpoint:** Dagger only ships the stdout/stderr log
-  stream when `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set (the `start` action does
-  this for you).
+- **Logs & metrics need the explicit endpoint:** Dagger only ships the
+  stdout/stderr log stream and the engine's per-exec resource-usage metrics when
+  `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` / `..._METRICS_ENDPOINT` are set (the
+  `start` action does this for you).
+- **Resource usage:** the engine reports per-exec gauges — CPU time
+  (`cpustat.*`), network bytes/packets (`netstat.*`), and CPU/IO pressure stalls
+  — tagged with the span they belong to. The viewer attaches them to each exec
+  span (a **usage** badge, a *Resource usage* panel) and shows run-wide totals in
+  the header; the text summary annotates the tree and prints the totals.
 - **Forwards to your existing collector:** if an OTLP endpoint is already
   exported in the job (`OTEL_EXPORTER_OTLP_ENDPOINT`, or the signal-specific
-  `..._TRACES_ENDPOINT` / `..._LOGS_ENDPOINT`), `start` reads it before pointing
-  Dagger at the local receiver and tees an untouched copy of the telemetry there
-  too — with your `OTEL_EXPORTER_OTLP_HEADERS` (auth) attached. Forwarding is
-  best-effort over HTTP/protobuf (it never fails the build); a gRPC endpoint
-  can't accept Dagger's bytes, so it's skipped with a note.
+  `..._TRACES_ENDPOINT` / `..._LOGS_ENDPOINT` / `..._METRICS_ENDPOINT`), `start`
+  reads it before pointing Dagger at the local receiver and tees an untouched
+  copy of the telemetry there too — with your `OTEL_EXPORTER_OTLP_HEADERS` (auth)
+  attached. Forwarding is best-effort over HTTP/protobuf (it never fails the
+  build); a gRPC endpoint can't accept Dagger's bytes, so it's skipped with a note.
 - **Standalone viewer:** open `scripts/viewer.html` directly and drag-and-drop
-  raw `traces.jsonl` / `logs.jsonl` (or `.gz`) — parsed locally, never uploaded.
+  raw `traces.jsonl` / `logs.jsonl` / `metrics.jsonl` (or `.gz`) — parsed
+  locally, never uploaded.
 
 ## Layout
 

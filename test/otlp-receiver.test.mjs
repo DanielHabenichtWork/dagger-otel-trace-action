@@ -18,10 +18,14 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gzipSync } from "node:zlib";
 import http from "node:http";
-import { decodeTraces, decodeLogs, inflate, startServer, parseOtlpHeaders } from "../scripts/otlp-receiver.mjs";
+import { decodeTraces, decodeLogs, decodeMetrics, inflate, startServer, parseOtlpHeaders } from "../scripts/otlp-receiver.mjs";
 
 const here = fileURLToPath(new URL(".", import.meta.url));
 const fx = join(here, "fixtures", "dagger-check");
+// Metrics come from a separate capture: the collector drops empty periodic
+// exports (Dagger's CLI sends resource-only batches with no metrics), so a
+// metric request maps 1:1 to a collector line only for metric-bearing batches.
+const fxm = join(here, "fixtures", "dagger-metrics");
 const summarize = join(here, "..", "scripts", "summarize.mjs");
 
 const canon = (x) =>
@@ -52,6 +56,40 @@ for (const [kind, decode] of [["traces", decodeTraces], ["logs", decodeLogs]]) {
     });
   });
 }
+
+test("metrics: each decoded batch matches the collector output", () => {
+  const files = readdirSync(join(fxm, "requests"))
+    .filter((f) => f.startsWith("metrics") && f.endsWith(".bin"))
+    .sort();
+  const expected = readFileSync(join(fxm, "expected", "metrics.jsonl"), "utf8")
+    .split("\n")
+    .filter(Boolean)
+    .map((l) => JSON.parse(l));
+  assert.equal(files.length, expected.length, "one request body per collector batch line");
+  assert.ok(files.length > 0, "metrics fixtures present");
+  files.forEach((f, i) => {
+    const mine = decodeMetrics(readFileSync(join(fxm, "requests", f)));
+    assert.deepEqual(canon(mine), canon(expected[i]), `metrics batch ${i} (${f}) differs from collector`);
+  });
+});
+
+test("metrics encoding contract: gauge int64 as string, hex exemplar span/trace, span attribution", () => {
+  const batch = decodeMetrics(readFileSync(join(fxm, "requests", "metrics-000.bin")));
+  const dps = batch.resourceMetrics.flatMap((rm) =>
+    rm.scopeMetrics.flatMap((sm) => sm.metrics.flatMap((m) => (m.gauge || m.sum).dataPoints)),
+  );
+  assert.ok(dps.length > 0, "gauge data points decoded");
+  const dp = dps[0];
+  assert.equal(typeof dp.asInt, "string", "asInt is a decimal string");
+  assert.match(dp.asInt, /^-?[0-9]+$/);
+  assert.equal(typeof dp.timeUnixNano, "string", "timeUnixNano is a decimal string");
+  // Every Dagger metric point is tagged with the span it belongs to.
+  const span = dp.attributes.find((a) => a.key === "dagger.io/metrics.span");
+  assert.match(span.value.stringValue, /^[0-9a-f]{16}$/, "metrics.span is 8-byte hex");
+  const ex = dp.exemplars[0];
+  assert.match(ex.spanId, /^[0-9a-f]{16}$/, "exemplar spanId is 8-byte hex");
+  assert.match(ex.traceId, /^[0-9a-f]{32}$/, "exemplar traceId is 16-byte hex");
+});
 
 test("encoding contract: hex ids, string 64-bit ints, numeric enums", () => {
   const batch = decodeTraces(readReq(reqFiles("traces")[0]));
@@ -166,9 +204,11 @@ test("live server: POSTing the request bodies reproduces the collector output", 
       headers: { "content-type": "application/x-protobuf", ...headers },
       body,
     });
+  const metricFiles = readdirSync(join(fxm, "requests")).filter((f) => f.endsWith(".bin")).sort();
   try {
     for (const f of reqFiles("traces")) await post("/v1/traces", readReq(f));
     for (const f of reqFiles("logs")) await post("/v1/logs", readReq(f));
+    for (const f of metricFiles) await post("/v1/metrics", readFileSync(join(fxm, "requests", f)));
   } finally {
     await new Promise((r) => server.close(r));
   }
@@ -178,4 +218,8 @@ test("live server: POSTing the request bodies reproduces the collector output", 
     assert.equal(got.length, exp.length);
     got.forEach((b, i) => assert.deepEqual(canon(b), canon(exp[i]), `${kind} batch ${i} via HTTP`));
   }
+  const gotM = readFileSync(join(dir, "metrics.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  const expM = readFileSync(join(fxm, "expected", "metrics.jsonl"), "utf8").split("\n").filter(Boolean).map((l) => JSON.parse(l));
+  assert.equal(gotM.length, expM.length);
+  gotM.forEach((b, i) => assert.deepEqual(canon(b), canon(expM[i]), `metrics batch ${i} via HTTP`));
 });

@@ -268,6 +268,31 @@ for (const batch of parseJsonl(join(dataDir, "logs.jsonl"))) {
 }
 for (const recs of logsBySpan.values()) recs.sort((a, b) => a.t - b.t);
 
+// Per-exec resource-usage gauges (CPU/network/IO), keyed to a span by the
+// dagger.io/metrics.span attribute. Gauges are cumulative totals for the exec,
+// so across periodic re-exports we keep the largest (latest) value.
+const metricsBySpan = new Map(); // spanId -> Map(name -> {value, unit})
+for (const batch of parseJsonl(join(dataDir, "metrics.jsonl"))) {
+  for (const rm of batch.resourceMetrics || []) {
+    for (const sm of rm.scopeMetrics || []) {
+      for (const m of sm.metrics || []) {
+        const points = m.gauge?.dataPoints || m.sum?.dataPoints || [];
+        for (const dp of points) {
+          const a = attrsToObj(dp.attributes);
+          const spanId = a["dagger.io/metrics.span"];
+          if (!spanId) continue;
+          const val = "asInt" in dp ? Number(dp.asInt) : "asDouble" in dp ? dp.asDouble : null;
+          if (val == null || Number.isNaN(val)) continue;
+          if (!metricsBySpan.has(spanId)) metricsBySpan.set(spanId, new Map());
+          const mm = metricsBySpan.get(spanId);
+          const prev = mm.get(m.name);
+          if (!prev || val >= prev.value) mm.set(m.name, { value: val, unit: m.unit || "" });
+        }
+      }
+    }
+  }
+}
+
 let minStart = Number.POSITIVE_INFINITY;
 let maxEnd = Number.NEGATIVE_INFINITY;
 const roots = [];
@@ -339,6 +364,61 @@ const fmtDur = (ms) =>
         : ms < 60000
           ? `${(ms / 1000).toFixed(2)}s`
           : `${Math.floor(ms / 60000)}m${((ms % 60000) / 1000).toFixed(0)}s`;
+const fmtBytes = (n) => {
+  if (!Number.isFinite(n)) return `${n}`;
+  if (n < 1024) return `${n}B`;
+  const u = ["KB", "MB", "GB", "TB"];
+  let v = n;
+  let i = -1;
+  do {
+    v /= 1024;
+    i++;
+  } while (v >= 1024 && i < u.length - 1);
+  return `${v < 10 ? v.toFixed(1) : Math.round(v)}${u[i]}`;
+};
+const fmtMicros = (us) => {
+  const ms = us / 1000;
+  if (ms < 1) return `${Math.round(us)}µs`;
+  if (ms < 1000) return `${ms < 10 ? ms.toFixed(1) : Math.round(ms)}ms`;
+  return `${(ms / 1000).toFixed(2)}s`;
+};
+// Subtree resource totals for a span. Metrics live on leaf exec spans, so a
+// subtree sum is meaningful and never double-counts. Returns null when nothing
+// in the subtree reported usage.
+function usageOf(span) {
+  let cpu = 0;
+  let netIn = 0;
+  let netOut = 0;
+  let any = false;
+  const visit = (s) => {
+    const mm = metricsBySpan.get(s.id);
+    if (mm) {
+      any = true;
+      cpu += mm.get("dagger.io/metrics.cpustat.usage")?.value || 0;
+      netIn += mm.get("dagger.io/metrics.netstat.rx.bytes")?.value || 0;
+      netOut += mm.get("dagger.io/metrics.netstat.tx.bytes")?.value || 0;
+    }
+    for (const c of s.children) visit(c);
+  };
+  visit(span);
+  return any ? { cpu, netIn, netOut } : null;
+}
+// A span's own resource usage (the exact exec the gauges were reported on),
+// without rolling up descendants. Returns null when the span reported none.
+function ownUsage(span) {
+  const mm = metricsBySpan.get(span.id);
+  if (!mm) return null;
+  return {
+    cpu: mm.get("dagger.io/metrics.cpustat.usage")?.value || 0,
+    netIn: mm.get("dagger.io/metrics.netstat.rx.bytes")?.value || 0,
+    netOut: mm.get("dagger.io/metrics.netstat.tx.bytes")?.value || 0,
+  };
+}
+// Compact "CPU 91ms net ↓1.6KB ↑42KB" tag, or "" when there's no usage / no net.
+const usageTag = (u) =>
+  u
+    ? `CPU ${fmtMicros(u.cpu)}${u.netIn || u.netOut ? ` net ↓${fmtBytes(u.netIn)} ↑${fmtBytes(u.netOut)}` : ""}`
+    : "";
 const stripAnsi = (s) => s.replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 const spanMatches = (s, q) => `${s.label} ${s.name}`.toLowerCase().includes(q);
@@ -443,7 +523,10 @@ function walk(list, depth, parentFailed, encapCtx) {
     shown++;
     const dur = c.end - c.start;
     const flags = (c.errVisible ? " ERROR" : "") + (c.cached ? " cached" : "");
-    lines.push(`${"  ".repeat(depth)}${clip(c.label, 160)}  ${fmtDur(dur)}${flags}`);
+    const tag = usageTag(ownUsage(c));
+    lines.push(
+      `${"  ".repeat(depth)}${clip(c.label, 160)}  ${fmtDur(dur)}${flags}${tag ? `  [${tag}]` : ""}`,
+    );
     visible.push({ span: c, depth, dur });
     walk(c.children, depth + 1, c.statusCode === 2 || parentFailed, c._childCtx);
   }
@@ -473,18 +556,30 @@ const slowest = visible
   .slice(0, topN);
 
 const totalDur = Number.isFinite(minStart) ? fmtDur(maxEnd - minStart) : "";
+let runCpu = 0;
+let runIn = 0;
+let runOut = 0;
+let runUsage = false;
+for (const mm of metricsBySpan.values()) {
+  runUsage = true;
+  runCpu += mm.get("dagger.io/metrics.cpustat.usage")?.value || 0;
+  runIn += mm.get("dagger.io/metrics.netstat.rx.bytes")?.value || 0;
+  runOut += mm.get("dagger.io/metrics.netstat.tx.bytes")?.value || 0;
+}
 out.push(`# ${title}`);
 out.push(
-  `${shown} spans · ${errorEntries.length} error${errorEntries.length === 1 ? "" : "s"}${totalDur ? ` · ${totalDur}` : ""}${cachedHidden && !showCached ? ` · ${cachedHidden} cached hidden` : ""}`,
+  `${shown} spans · ${errorEntries.length} error${errorEntries.length === 1 ? "" : "s"}${totalDur ? ` · ${totalDur}` : ""}${cachedHidden && !showCached ? ` · ${cachedHidden} cached hidden` : ""}${runUsage ? ` · CPU ${fmtMicros(runCpu)} · net ↓${fmtBytes(runIn)} ↑${fmtBytes(runOut)}` : ""}`,
 );
 
 if (slowest.length) {
   const w = Math.max(...slowest.map((v) => fmtDur(v.dur).length));
   out.push("", "## slowest");
-  for (const v of slowest)
+  for (const v of slowest) {
+    const tag = usageTag(usageOf(v.span));
     out.push(
-      `${fmtDur(v.dur).padStart(w)}  ${clip(v.span.label, 160)}${v.span.errVisible ? "  ERROR" : ""}`,
+      `${fmtDur(v.dur).padStart(w)}  ${clip(v.span.label, 160)}${v.span.errVisible ? "  ERROR" : ""}${tag ? `  [${tag}]` : ""}`,
     );
+  }
 }
 
 if (errorEntries.length) {

@@ -1,7 +1,8 @@
 name: "Start Dagger trace collector"
 description: >
   Start a dependency-free OTLP receiver that captures Dagger's OpenTelemetry
-  stream (spans + per-step stdout/stderr) to files, and export the
+  stream (spans + per-step stdout/stderr + per-exec resource-usage metrics) to
+  files, and export the
   OTEL_EXPORTER_OTLP_* variables so subsequent `dagger` steps send telemetry to
   it. No Docker required — it runs on the runner's own Node (the one that
   executes JavaScript actions). Pair with the `finish` action after your dagger
@@ -10,8 +11,9 @@ description: >
 inputs:
   data-dir:
     description: >
-      Directory the receiver writes traces.jsonl / logs.jsonl to. Defaults to
-      $RUNNER_TEMP/dagger-otel; pass the SAME value to the finish action.
+      Directory the receiver writes traces.jsonl / logs.jsonl / metrics.jsonl
+      to. Defaults to $RUNNER_TEMP/dagger-otel; pass the SAME value to the finish
+      action.
     required: false
     default: ""
 

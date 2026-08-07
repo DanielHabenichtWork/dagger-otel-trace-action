@@ -21,7 +21,7 @@ Everything stays on the runner. Nothing is sent to an external service.
 ## Data flow
 
 ```
-dagger step ──OTLP/protobuf──> otlp-receiver.mjs (Node) ──> <data-dir>/{traces,logs}.jsonl
+dagger step ──OTLP/protobuf──> otlp-receiver.mjs (Node) ──> <data-dir>/{traces,logs,metrics}.jsonl
                                                                   │
                                           bundle.sh: gzip + base64-embed into viewer.html
                                                                   │
@@ -33,24 +33,33 @@ dagger step ──OTLP/protobuf──> otlp-receiver.mjs (Node) ──> <data-di
 - **No Docker (v1.5+).** Capture was originally an `otel-collector-contrib`
   container; it's now `scripts/otlp-receiver.mjs`, a dependency-free Node HTTP
   server that decodes OTLP/protobuf into the *exact* OTLP-JSON the collector's
-  file exporter wrote (so viewer/summarize are unchanged). In CI it's launched
+  file exporter wrote (so viewer/summarize are unchanged). It handles all three
+  signals — `/v1/{traces,logs,metrics}` → `{traces,logs,metrics}.jsonl`. In CI it's launched
   with the runner's own Node via `process.execPath` (see `start/action.yml`), so
   no Node-on-PATH or Docker is needed. Correctness is pinned by
   `test/otlp-receiver.test.mjs` against fixtures captured from the real
   collector — don't change the decode output shape without updating/rerunning it.
+  Metrics have their own oracle fixture (`test/fixtures/dagger-metrics`): the
+  gauge/NumberDataPoint/exemplar decode is verified byte-for-byte against the
+  collector. Dagger only emits int **gauges** (per-exec CPU/network/IO under the
+  `dagger.io/engine.buildkit` scope, each point tagged `dagger.io/metrics.span`);
+  Sum reuses the same NumberDataPoint decode, Histogram/Summary aren't emitted so
+  their data points aren't decoded (name/unit still pass through).
 - The receiver binds a **random loopback port** (concurrent jobs on one runner
   don't collide, given distinct `data-dir`s) and writes `receiver.json`
   (`{port,pid}`); `finish` stops it by pid.
-- Dagger only ships the **stdout/stderr log stream** when
-  `OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` is set explicitly — `start.sh` sets both the
-  generic endpoint and the signal-specific logs endpoint. With only the generic
-  one you get spans but no output. (Learned empirically; don't "simplify" it away.)
+- Dagger only ships the **stdout/stderr log stream** and the engine's **per-exec
+  resource-usage metrics** when the signal-specific endpoints
+  (`OTEL_EXPORTER_OTLP_LOGS_ENDPOINT` / `..._METRICS_ENDPOINT`) are set
+  explicitly — `start.sh` sets the generic endpoint plus both signal-specific
+  ones. With only the generic one you get spans but no output and no metrics.
+  (Learned empirically; don't "simplify" it away.)
 - **Pass-through to a pre-existing collector.** `start.sh` reads any OTLP
   endpoint already in the job env (`OTEL_EXPORTER_OTLP_ENDPOINT`, or the
   signal-specific `..._TRACES/LOGS_ENDPOINT`) *before* it overwrites those vars
   with our loopback receiver, resolves per-signal upstream URLs (OTLP spec rule:
   signal-specific verbatim, generic gets `/v1/<signal>`), and passes them +
-  `OTEL_EXPORTER_OTLP_HEADERS` to the receiver as `FORWARD_{TRACES,LOGS}[_HEADERS]`.
+  `OTEL_EXPORTER_OTLP_HEADERS` to the receiver as `FORWARD_{TRACES,LOGS,METRICS}[_HEADERS]`.
   The receiver tees the **raw request bytes verbatim** (same content-type/encoding
   the SDK sent — no re-encode) to that upstream, best-effort: forward errors only
   hit stderr, never the local capture or the 200 owed to Dagger. Forwarding is
@@ -68,11 +77,11 @@ dagger step ──OTLP/protobuf──> otlp-receiver.mjs (Node) ──> <data-di
 |---|---|
 | `start/action.yml` | composite: resolve dirs, then a `github-script` step runs `scripts/start.sh` under the runner's Node (`process.execPath`) |
 | `finish/action.yml` | composite: build `meta.json`, `scripts/finish.sh`, `upload-artifact`, `github-script` (summary + PR comment) |
-| `scripts/otlp-receiver.mjs` | dependency-free Node OTLP/HTTP receiver: decode OTLP/protobuf → collector-shaped `{traces,logs}.jsonl`; also the capture "server" |
+| `scripts/otlp-receiver.mjs` | dependency-free Node OTLP/HTTP receiver: decode OTLP/protobuf → collector-shaped `{traces,logs,metrics}.jsonl`; also the capture "server" |
 | `scripts/start.sh` | resolve any pre-existing OTLP endpoint into `FORWARD_*`; background the receiver (`${NODE:-node}`); print/export `OTEL_*`; readiness-poll on `receiver.json` |
 | `scripts/finish.sh` | stop the receiver (SIGTERM by pid from `receiver.json`); call `bundle.sh` |
 | `scripts/bundle.sh` | gzip+base64-embed `traces.jsonl`/`logs.jsonl`/`meta.json` into `viewer.html` at the `<!--__DAGGER_TRACE_DATA__-->` marker |
-| `test/otlp-receiver.test.mjs` | `node:test` harness: receiver output == collector output, against `test/fixtures/` (run by `dagger check`'s `test`) |
+| `test/otlp-receiver.test.mjs` | `node:test` harness: receiver output == collector output, against `test/fixtures/{dagger-check,dagger-metrics}` (run by `dagger check`'s `test`) |
 | `scripts/viewer.html` | the entire viewer — **where almost all real work happens** |
 
 Composite steps reference sibling scripts via `$GITHUB_ACTION_PATH/../scripts/`
@@ -105,6 +114,14 @@ that way. Rough map (line numbers drift; grep for the names):
   lowercased). Use `label` for display, `search` for filtering.
 - **`ingestLogs`** — log records keyed by span id; `t` is kept in **nanoseconds**
   (spans convert to ms; mind the unit when comparing).
+- **`ingestMetrics` / `collectMetrics` / `METRIC_META`** — the engine's per-exec
+  gauges, keyed to a span by the `dagger.io/metrics.span` datapoint attribute.
+  Gauges are cumulative totals, so across periodic re-exports of the same span we
+  keep the **max** value. `collectMetrics(span, deep)` sums over the subtree (safe
+  — metrics live only on leaf exec spans, so no double-count). Values format by
+  unit (`bytes`→KB/MB, `us`→ms/s, else count); unknown metric names fall back to a
+  prettified label. Surfaced as a per-row **usage** badge, a *Resource usage*
+  detail section, and a run-total chip in the summary header.
 - **`render` / `addRow`** — the span waterfall tree.
 - **`select`** — the detail panel: Error, Output (with timing), Call (decoded
   op+args), and a Span table showing **every** attribute (long/base64 values

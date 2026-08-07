@@ -116,6 +116,7 @@ runs:
         path: |
           ${{ steps.bundle.outputs.data-dir }}/traces.jsonl
           ${{ steps.bundle.outputs.data-dir }}/logs.jsonl
+          ${{ steps.bundle.outputs.data-dir }}/metrics.jsonl
           ${{ steps.summarize.outputs.summary }}
         if-no-files-found: ignore
         overwrite: true
@@ -138,8 +139,8 @@ runs:
           const url = process.env.ARTIFACT_URL;
           const line = `### 📊 [View the Dagger trace](${url})`;
 
-          // How to get the raw traces/logs and drill into a step. The raw
-          // artifact holds traces.jsonl + logs.jsonl + the summary; `gh run
+          // How to get the raw capture and drill into a step. The raw artifact
+          // holds traces.jsonl + logs.jsonl + metrics.jsonl + the summary; `gh run
           // download` fetches it, then `dagger-trace report` re-analyzes it
           // offline. `gh` needs no run id — it defaults to the current run.
           const rawUrl = process.env.RAW_ARTIFACT_URL;
@@ -148,7 +149,7 @@ runs:
           const howto = rawUrl
             ? [
                 '',
-                `Raw traces + logs: [\`${rawName}\`](${rawUrl}) — download and drill into a step offline:`,
+                `Raw traces + logs + metrics: [\`${rawName}\`](${rawUrl}) — download and drill into a step offline:`,
                 '',
                 '```sh',
                 `gh run download ${runId} -n ${rawName} -D dagger-trace`,

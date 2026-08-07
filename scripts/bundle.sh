@@ -38,6 +38,9 @@ embed() { # embed <id> <file>
   if [[ -s "$data_dir/logs.jsonl" ]]; then
     embed data-logs "$data_dir/logs.jsonl"
   fi
+  if [[ -s "$data_dir/metrics.jsonl" ]]; then
+    embed data-metrics "$data_dir/metrics.jsonl"
+  fi
   sed -n "/^$marker\$/,\$p" "$template" | sed '1d'
 } > "$out"
 

@@ -44,14 +44,19 @@ fwd_traces=$(resolve_fwd "${OTEL_EXPORTER_OTLP_TRACES_ENDPOINT:-}" "${OTEL_EXPOR
   "${OTEL_EXPORTER_OTLP_TRACES_PROTOCOL:-${OTEL_EXPORTER_OTLP_PROTOCOL:-}}")
 fwd_logs=$(resolve_fwd "${OTEL_EXPORTER_OTLP_LOGS_ENDPOINT:-}" "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" /v1/logs \
   "${OTEL_EXPORTER_OTLP_LOGS_PROTOCOL:-${OTEL_EXPORTER_OTLP_PROTOCOL:-}}")
+fwd_metrics=$(resolve_fwd "${OTEL_EXPORTER_OTLP_METRICS_ENDPOINT:-}" "${OTEL_EXPORTER_OTLP_ENDPOINT:-}" /v1/metrics \
+  "${OTEL_EXPORTER_OTLP_METRICS_PROTOCOL:-${OTEL_EXPORTER_OTLP_PROTOCOL:-}}")
 fwd_traces_headers="${OTEL_EXPORTER_OTLP_TRACES_HEADERS:-${OTEL_EXPORTER_OTLP_HEADERS:-}}"
 fwd_logs_headers="${OTEL_EXPORTER_OTLP_LOGS_HEADERS:-${OTEL_EXPORTER_OTLP_HEADERS:-}}"
+fwd_metrics_headers="${OTEL_EXPORTER_OTLP_METRICS_HEADERS:-${OTEL_EXPORTER_OTLP_HEADERS:-}}"
 [[ -n "$fwd_traces" ]] && echo "forwarding a copy of traces to $fwd_traces" >&2
 [[ -n "$fwd_logs" ]] && echo "forwarding a copy of logs to $fwd_logs" >&2
+[[ -n "$fwd_metrics" ]] && echo "forwarding a copy of metrics to $fwd_metrics" >&2
 
 # Detach fully so the receiver outlives this shell (and, in CI, this step).
-FORWARD_TRACES="$fwd_traces" FORWARD_LOGS="$fwd_logs" \
+FORWARD_TRACES="$fwd_traces" FORWARD_LOGS="$fwd_logs" FORWARD_METRICS="$fwd_metrics" \
   FORWARD_TRACES_HEADERS="$fwd_traces_headers" FORWARD_LOGS_HEADERS="$fwd_logs_headers" \
+  FORWARD_METRICS_HEADERS="$fwd_metrics_headers" \
   nohup "$node_bin" "$dir/otlp-receiver.mjs" "$data_dir" >"$data_dir/receiver.log" 2>&1 &
 disown 2>/dev/null || true
 
@@ -68,13 +73,16 @@ fi
 endpoint="http://127.0.0.1:$port"
 echo "OTLP receiver listening on $endpoint, writing to $data_dir" >&2
 
-# Dagger only ships the log stream (per-exec stdout/stderr) when the
-# logs endpoint is set explicitly, so set the signal-specific vars too.
+# Dagger only ships the log stream (per-exec stdout/stderr) and the engine's
+# per-exec resource-usage metrics (CPU/network/IO) when those signal-specific
+# endpoints are set explicitly, so set them alongside the generic one.
 vars=(
   "OTEL_EXPORTER_OTLP_ENDPOINT=$endpoint"
   "OTEL_EXPORTER_OTLP_PROTOCOL=http/protobuf"
   "OTEL_EXPORTER_OTLP_LOGS_ENDPOINT=$endpoint/v1/logs"
   "OTEL_EXPORTER_OTLP_LOGS_PROTOCOL=http/protobuf"
+  "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT=$endpoint/v1/metrics"
+  "OTEL_EXPORTER_OTLP_METRICS_PROTOCOL=http/protobuf"
 )
 for v in "${vars[@]}"; do
   echo "export $v"

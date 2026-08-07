@@ -49,6 +49,9 @@
   .badge.error { color: #fff; background: var(--err); }
   .badge.errdeep { color: var(--err); border: 1px solid #f8514955; }
   .badge.logs { color: var(--fg-dim); border: 1px solid var(--border); }
+  .badge.metrics { color: var(--warn); border: 1px solid #d2992255; }
+  table.attrs td.mval { color: var(--fg); white-space: nowrap; text-align: right; width: 1%; }
+  table.attrs td.mraw { color: var(--fg-dim); white-space: nowrap; }
   .badge.check-ok { color: var(--ok); border: 1px solid #2ea04366; }
   .badge.check-fail { color: #fff; background: var(--err); }
   .row .spacer { flex: 1; min-width: 24px; }
@@ -113,7 +116,7 @@
     <div id="dropzone">
       <div><strong>Drop OTLP JSONL files here</strong> (traces / logs, plain or .gz)</div>
       <div>Files are read locally in your browser — nothing is uploaded.</div>
-      <div><code>traces.jsonl</code> and <code>logs.jsonl</code> from the otel-collector file exporter</div>
+      <div><code>traces.jsonl</code>, <code>logs.jsonl</code> and <code>metrics.jsonl</code> from the otel-collector file exporter</div>
       <input type="file" id="fileinput" multiple accept=".jsonl,.json,.gz">
     </div>
     <div id="rows"></div>
@@ -275,7 +278,8 @@ function callLabel(call, fallback) {
 const state = {
   spans: new Map(),      // spanId -> span
   roots: [],
-  logsBySpan: new Map(), // spanId -> [logRecord]
+  logsBySpan: new Map(),    // spanId -> [logRecord]
+  metricsBySpan: new Map(), // spanId -> Map(metricName -> {value, unit})
   minStart: Infinity, maxEnd: -Infinity,
   selected: null,
   expanded: new Set(),
@@ -341,6 +345,90 @@ function ingestLogs(batches) {
   }
   for (const recs of state.logsBySpan.values()) recs.sort((a, b) => a.t - b.t);
 }
+
+/* ---------- metrics ----------
+   Dagger's engine emits per-exec resource-usage gauges (CPU / network / IO
+   pressure) under the dagger.io/engine.buildkit scope. Every data point is
+   tagged with dagger.io/metrics.span, so we attach each metric to its span.
+   The gauges are cumulative totals for the exec, so across periodic re-exports
+   of the same span we keep the largest (latest) value. */
+const METRIC_META = {
+  "dagger.io/metrics.cpustat.usage":               { label: "CPU total",        order: 10 },
+  "dagger.io/metrics.cpustat.user":                { label: "CPU user",         order: 11 },
+  "dagger.io/metrics.cpustat.system":              { label: "CPU system",       order: 12 },
+  "dagger.io/metrics.cpustat.pressure.some.total": { label: "CPU stall",        order: 13 },
+  "dagger.io/metrics.cpustat.pressure.full.total": { label: "CPU stall (full)", order: 14 },
+  "dagger.io/metrics.iostat.pressure.some.total":  { label: "IO stall",         order: 20 },
+  "dagger.io/metrics.iostat.pressure.full.total":  { label: "IO stall (full)",  order: 21 },
+  "dagger.io/metrics.netstat.rx.bytes":            { label: "Net in",           order: 30 },
+  "dagger.io/metrics.netstat.tx.bytes":            { label: "Net out",          order: 31 },
+  "dagger.io/metrics.netstat.rx.packets":          { label: "Packets in",       order: 32 },
+  "dagger.io/metrics.netstat.tx.packets":          { label: "Packets out",      order: 33 },
+  "dagger.io/metrics.netstat.rx.dropped":          { label: "Rx dropped",       order: 34 },
+  "dagger.io/metrics.netstat.tx.dropped":          { label: "Tx dropped",       order: 35 },
+};
+function metricInfo(name) {
+  return METRIC_META[name] || { label: name.replace(/^dagger\.io\/metrics\./, "").replace(/\./g, " "), order: 99 };
+}
+const fmtBytes = n => {
+  if (!isFinite(n)) return "" + n;
+  if (n < 1024) return n + " B";
+  const u = ["KB", "MB", "GB", "TB"]; let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return (n < 10 ? n.toFixed(1) : Math.round(n)) + " " + u[i];
+};
+const fmtMicros = us => {
+  const ms = us / 1000;
+  if (ms < 1) return Math.round(us) + "µs";
+  if (ms < 1000) return (ms < 10 ? ms.toFixed(1) : Math.round(ms)) + "ms";
+  return (ms / 1000).toFixed(2) + "s";
+};
+const fmtCount = n => n.toLocaleString("en-US");
+// A metric value formatted for its unit (bytes → KB/MB, µs → ms/s, else count).
+function fmtMetric(value, unit) {
+  if (unit === "bytes") return fmtBytes(value);
+  if (unit === "us") return fmtMicros(value);
+  return fmtCount(value);
+}
+function ingestMetrics(batches) {
+  for (const batch of batches) {
+    for (const rm of batch.resourceMetrics || []) {
+      for (const sm of rm.scopeMetrics || []) {
+        for (const m of sm.metrics || []) {
+          const points = ((m.gauge && m.gauge.dataPoints) || (m.sum && m.sum.dataPoints) || []);
+          for (const dp of points) {
+            const a = attrsToObj(dp.attributes);
+            const spanId = a["dagger.io/metrics.span"];
+            if (!spanId) continue;
+            const val = "asInt" in dp ? Number(dp.asInt) : "asDouble" in dp ? dp.asDouble : null;
+            if (val == null || Number.isNaN(val)) continue;
+            if (!state.metricsBySpan.has(spanId)) state.metricsBySpan.set(spanId, new Map());
+            const mm = state.metricsBySpan.get(spanId);
+            const prev = mm.get(m.name);
+            if (!prev || val >= prev.value) mm.set(m.name, { value: val, unit: m.unit || "" });
+          }
+        }
+      }
+    }
+  }
+}
+// Metrics for a span, summed over its subtree (metrics live on the leaf exec
+// spans, so a subtree total is meaningful and never double-counts). Returns a
+// Map(name -> {value, unit}).
+function collectMetrics(span, deep) {
+  const out = new Map();
+  const add = id => {
+    const mm = state.metricsBySpan.get(id);
+    if (!mm) return;
+    for (const [name, { value, unit }] of mm) {
+      const p = out.get(name);
+      out.set(name, { value: (p ? p.value : 0) + value, unit });
+    }
+  };
+  const visit = s => { add(s.id); if (deep) s.children.forEach(visit); };
+  visit(span);
+  return out;
+}
 function buildTree() {
   state.roots = [];
   for (const span of state.spans.values()) {
@@ -363,13 +451,16 @@ function buildTree() {
   // surfaces them.
   const visit = (span, suppressed) => {
     span.hasLogs = state.logsBySpan.has(span.id);
+    span.hasMetrics = state.metricsBySpan.has(span.id);
     span.errVisible = span.statusCode === 2 && !suppressed;
     span.errDeep = span.errVisible;
     span.logsDeep = span.hasLogs;
+    span.metricsDeep = span.hasMetrics;
     for (const c of span.children) {
       visit(c, suppressed || c.internal || ((c.encapsulated || c.infra) && span.statusCode !== 2));
       span.errDeep = span.errDeep || c.errDeep;
       span.logsDeep = span.logsDeep || c.logsDeep;
+      span.metricsDeep = span.metricsDeep || c.metricsDeep;
     }
   };
   state.roots.forEach(r => visit(r, r.internal));
@@ -433,6 +524,7 @@ function render() {
       (span.statusCode === 2 ? `<span class="badge error">ERROR</span>` : span.errDeep ? `<span class="badge errdeep">error inside</span>` : "") +
       (span.cached ? `<span class="badge cached">CACHED</span>` : "") +
       (span.hasLogs ? `<span class="badge logs">output</span>` : "") +
+      (span.hasMetrics ? `<span class="badge metrics">usage</span>` : "") +
       `<span class="spacer"></span><span class="dur">${fmtDur(span.end - span.start)}</span>` +
       `<span class="track"><span class="bar" style="left:${left}%;width:${width}%"></span></span>`;
     row.dataset.id = span.id;
@@ -600,6 +692,22 @@ function select(id) {
       <tr><td>op</td><td>${esc(span.call.op)}</td></tr>${argRows}</table>`;
     body.appendChild(callSec);
   }
+  // Resource usage: the engine's per-exec CPU/network/IO gauges, summed over the
+  // subtree so a container step (or a whole pipeline) shows its totals.
+  const metrics = collectMetrics(span, true);
+  if (metrics.size) {
+    const subtree = !span.hasMetrics;
+    const rows = [...metrics.entries()]
+      .map(([name, { value, unit }]) => ({ name, value, unit, ...metricInfo(name) }))
+      .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label))
+      .map(m => `<tr><td>${esc(m.label)}</td><td class="mval">${esc(fmtMetric(m.value, m.unit))}</td>` +
+        `<td class="mraw">${esc(fmtCount(m.value))}${m.unit ? " " + esc(m.unit) : ""}</td></tr>`)
+      .join("");
+    const sec = document.createElement("section");
+    sec.innerHTML = `<h3>Resource usage${subtree ? " <span style=\"font-weight:normal;text-transform:none;letter-spacing:0\">(subtree total)</span>" : ""}</h3>` +
+      `<table class="attrs">${rows}</table>`;
+    body.appendChild(sec);
+  }
   // Every attribute is shown (nothing dropped); long/base64 values collapse.
   const attrs = Object.entries(span.attrs);
   const timing = document.createElement("section");
@@ -615,6 +723,18 @@ function select(id) {
 }
 
 /* ---------- summary ---------- */
+// Run-wide resource totals for the header chip: sum each span's own gauges.
+function totalUsage() {
+  let cpu = 0, netIn = 0, netOut = 0, any = false;
+  for (const mm of state.metricsBySpan.values()) {
+    const g = n => (mm.has(n) ? mm.get(n).value : 0);
+    cpu += g("dagger.io/metrics.cpustat.usage");
+    netIn += g("dagger.io/metrics.netstat.rx.bytes");
+    netOut += g("dagger.io/metrics.netstat.tx.bytes");
+    if (mm.size) any = true;
+  }
+  return any ? { cpu, netIn, netOut } : null;
+}
 function renderSummary() {
   const el = document.getElementById("summary");
   el.hidden = false;
@@ -623,6 +743,8 @@ function renderSummary() {
   const errors = spans.filter(s => s.errVisible);
   const chips = [];
   chips.push(`<span class="chip plain">${spans.length} spans · ${fmtDur(state.maxEnd - state.minStart)} total</span>`);
+  const usage = totalUsage();
+  if (usage) chips.push(`<span class="chip plain" title="Engine resource usage across all execs">⚡ CPU ${fmtMicros(usage.cpu)} · net ↓${fmtBytes(usage.netIn)} ↑${fmtBytes(usage.netOut)}</span>`);
   for (const c of checks.sort((a, b) => a.start - b.start)) {
     chips.push(`<span class="chip ${c.checkPassed === false ? "err" : "ok"}" data-goto="${c.id}">${c.checkPassed === false ? "✗" : "✓"} ${esc(c.checkName)}</span>`);
   }
@@ -644,6 +766,7 @@ function renderSummary() {
 function autoDetectIngest(batches) {
   ingestTraces(batches.filter(b => b.resourceSpans));
   ingestLogs(batches.filter(b => b.resourceLogs));
+  ingestMetrics(batches.filter(b => b.resourceMetrics));
 }
 function finishLoad() {
   buildTree();
@@ -681,9 +804,11 @@ async function loadEmbedded() {
   }
   const tEl = document.getElementById("data-traces");
   const lEl = document.getElementById("data-logs");
+  const mEl = document.getElementById("data-metrics");
   if (!tEl) return false;
   autoDetectIngest(parseJsonl(await gunzipB64(tEl.textContent)));
   if (lEl) autoDetectIngest(parseJsonl(await gunzipB64(lEl.textContent)));
+  if (mEl) autoDetectIngest(parseJsonl(await gunzipB64(mEl.textContent)));
   finishLoad();
   return true;
 }

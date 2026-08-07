@@ -68,6 +68,7 @@ const str = (u8) => TE.decode(u8);
 const hex = (u8) => Buffer.from(u8).toString("hex");
 const dv = (u8) => new DataView(u8.buffer, u8.byteOffset, u8.byteLength);
 const u64 = (u8) => dv(u8).getBigUint64(0, true).toString();
+const i64 = (u8) => dv(u8).getBigInt64(0, true).toString();
 const f64 = (u8) => dv(u8).getFloat64(0, true);
 const u32 = (u8) => dv(u8).getUint32(0, true);
 
@@ -364,6 +365,147 @@ export function decodeLogs(buf) {
   return { resourceLogs: rl };
 }
 
+// metrics/v1. Dagger emits per-exec resource-usage gauges (CPU/network/IO
+// pressure) under the dagger.io/engine.buildkit scope; each NumberDataPoint is
+// tagged with dagger.io/metrics.{span,trace} so the viewer can attach it to a
+// span. Gauge is verified against the collector oracle
+// (test/fixtures/dagger-metrics); Sum reuses the same NumberDataPoint and the
+// same string-int64 / numeric-enum encoding conventions the trace/log decoders
+// are already pinned to. Histogram/Summary aren't emitted by Dagger, so their
+// data points aren't decoded (the metric name/unit still pass through).
+function exemplar(buf) {
+  const e = {};
+  const filtered = [];
+  for (const f of scan(buf)) {
+    switch (f.field) {
+      case 2:
+        e.timeUnixNano = u64(f.val);
+        break;
+      case 3:
+        e.asDouble = f64(f.val);
+        break;
+      case 4:
+        if (f.val.length) e.spanId = hex(f.val);
+        break;
+      case 5:
+        if (f.val.length) e.traceId = hex(f.val);
+        break;
+      case 6:
+        e.asInt = i64(f.val);
+        break;
+      case 7:
+        filtered.push(keyValue(f.val));
+        break;
+    }
+  }
+  if (filtered.length) e.filteredAttributes = filtered;
+  return e;
+}
+function numberDataPoint(buf) {
+  const dp = {};
+  const attrs = [];
+  const exemplars = [];
+  for (const f of scan(buf)) {
+    switch (f.field) {
+      case 2:
+        dp.startTimeUnixNano = u64(f.val);
+        break;
+      case 3:
+        dp.timeUnixNano = u64(f.val);
+        break;
+      case 4:
+        dp.asDouble = f64(f.val);
+        break;
+      case 5:
+        exemplars.push(exemplar(f.val));
+        break;
+      case 6:
+        dp.asInt = i64(f.val);
+        break;
+      case 7:
+        attrs.push(keyValue(f.val));
+        break;
+      case 8: {
+        const flags = u32(f.val);
+        if (flags) dp.flags = flags;
+        break;
+      }
+    }
+  }
+  if (attrs.length) dp.attributes = attrs;
+  if (exemplars.length) dp.exemplars = exemplars;
+  return dp;
+}
+function numberDataPoints(buf) {
+  const dps = [];
+  const o = {};
+  for (const f of scan(buf)) {
+    if (f.field === 1) dps.push(numberDataPoint(f.val));
+    else if (f.field === 2) {
+      const t = Number(f.val); // aggregationTemporality (Sum/Gauge share this fn; Gauge has none)
+      if (t) o.aggregationTemporality = t;
+    } else if (f.field === 3 && f.val !== 0n) o.isMonotonic = true;
+  }
+  if (dps.length) o.dataPoints = dps;
+  return o;
+}
+function metric(buf) {
+  const m = {};
+  const metadata = [];
+  for (const f of scan(buf)) {
+    switch (f.field) {
+      case 1:
+        m.name = str(f.val);
+        break;
+      case 2:
+        if (f.val.length) m.description = str(f.val);
+        break;
+      case 3:
+        if (f.val.length) m.unit = str(f.val);
+        break;
+      case 5:
+        m.gauge = numberDataPoints(f.val);
+        break;
+      case 7:
+        m.sum = numberDataPoints(f.val);
+        break;
+      case 12:
+        metadata.push(keyValue(f.val));
+        break;
+    }
+  }
+  if (metadata.length) m.metadata = metadata;
+  return m;
+}
+function scopeMetrics(buf) {
+  const o = { scope: {} };
+  const metrics = [];
+  for (const f of scan(buf)) {
+    if (f.field === 1) o.scope = scopeMsg(f.val);
+    else if (f.field === 2) metrics.push(metric(f.val));
+    else if (f.field === 3 && f.val.length) o.schemaUrl = str(f.val);
+  }
+  if (metrics.length) o.metrics = metrics;
+  return o;
+}
+function resourceMetrics(buf) {
+  const o = { resource: {} };
+  const sm = [];
+  for (const f of scan(buf)) {
+    if (f.field === 1) o.resource = resource(f.val);
+    else if (f.field === 2) sm.push(scopeMetrics(f.val));
+    else if (f.field === 3 && f.val.length) o.schemaUrl = str(f.val);
+  }
+  if (sm.length) o.scopeMetrics = sm;
+  return o;
+}
+export function decodeMetrics(buf) {
+  const rm = scan(buf)
+    .filter((f) => f.field === 1 && f.wire === 2)
+    .map((f) => resourceMetrics(f.val));
+  return { resourceMetrics: rm };
+}
+
 // Decode a gzip/deflate-or-identity request body into raw protobuf bytes.
 export function inflate(body, contentEncoding) {
   const enc = (contentEncoding || "").toLowerCase();
@@ -432,20 +574,21 @@ export function startServer({ dataDir, port = 0, host = "127.0.0.1", forward = {
   const files = {
     traces: join(dataDir, "traces.jsonl"),
     logs: join(dataDir, "logs.jsonl"),
+    metrics: join(dataDir, "metrics.jsonl"),
   };
+  const decoders = { traces: decodeTraces, logs: decodeLogs, metrics: decodeMetrics };
   const server = http.createServer((req, res) => {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
       const raw = Buffer.concat(chunks);
       const m = (req.url || "").match(/\/v1\/(traces|logs|metrics)/);
-      if (m && m[1] !== "metrics") {
+      if (m) {
         // Forward the untouched bytes first so a decode bug can't drop the tee.
         if (forward[m[1]]) forwardBatch(forward[m[1]], raw, req.headers);
         try {
           const body = inflate(raw, req.headers["content-encoding"]);
-          const batch = m[1] === "traces" ? decodeTraces(body) : decodeLogs(body);
-          appendFileSync(files[m[1]], `${JSON.stringify(batch)}\n`);
+          appendFileSync(files[m[1]], `${JSON.stringify(decoders[m[1]](body))}\n`);
         } catch (e) {
           process.stderr.write(`otlp-receiver: decode error: ${e.stack || e}\n`);
         }
@@ -485,7 +628,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
   // FORWARD_{TRACES,LOGS}[_HEADERS] are resolved by start.sh from any OTLP
   // endpoint the runner already exported — tee a copy of the capture there too.
   const forward = {};
-  for (const sig of ["traces", "logs"]) {
+  for (const sig of ["traces", "logs", "metrics"]) {
     const url = process.env[`FORWARD_${sig.toUpperCase()}`];
     if (url) {
       forward[sig] = {
@@ -500,7 +643,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     info.endpoint = `http://${host}:${info.port}`;
     writeFileSync(join(dataDir, "receiver.json"), JSON.stringify(info));
     process.stderr.write(`otlp-receiver on ${info.endpoint} (pid ${info.pid})\n`);
-    for (const sig of ["traces", "logs"]) {
+    for (const sig of ["traces", "logs", "metrics"]) {
       if (forward[sig])
         process.stderr.write(`otlp-receiver: forwarding ${sig} to ${forward[sig].url}\n`);
     }
