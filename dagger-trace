@@ -176,11 +176,19 @@ fi
 # the viewer header. Fields left empty are simply omitted by the viewer.
 json_str() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; printf '"%s"' "$s"; }
 git_val() { git "$@" 2>/dev/null || true; }
+origin=$(git_val remote get-url origin)
+case "$origin" in
+  git@github.com:*) repo_url="https://github.com/${origin#git@github.com:}" ;;
+  http://github.com/*|https://github.com/*) repo_url=$origin ;;
+  *) repo_url="" ;;
+esac
+repo_url=${repo_url%.git}
 meta="$data_dir/meta.json"
 {
   printf '{\n'
   printf '  "title": %s,\n' "$(json_str "${title:-${cmd[*]}}")"
   printf '  "repo": %s,\n'  "$(json_str "$(basename "$(git_val rev-parse --show-toplevel)")")"
+  printf '  "repoUrl": %s,\n' "$(json_str "$repo_url")"
   printf '  "ref": %s,\n'   "$(json_str "$(git_val rev-parse --abbrev-ref HEAD)")"
   printf '  "sha": %s,\n'   "$(json_str "$(git_val rev-parse HEAD)")"
   printf '  "date": %s\n'   "$(json_str "$(date -u +%FT%TZ)")"

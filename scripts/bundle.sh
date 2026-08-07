@@ -12,7 +12,14 @@ data_dir=$1
 out=$2
 meta=${3:-}
 template="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/viewer.html"
+package_json="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)/package.json"
 marker='<!--__DAGGER_TRACE_DATA__-->'
+
+version=$(sed -n 's/^[[:space:]]*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$package_json" | head -1)
+if [[ -z "$version" ]]; then
+  echo "error: could not read the viewer version from $package_json" >&2
+  exit 1
+fi
 
 if [[ ! -s "$data_dir/traces.jsonl" ]]; then
   echo "error: $data_dir/traces.jsonl is missing or empty (did the collector run?)" >&2
@@ -28,6 +35,7 @@ embed() { # embed <id> <file>
 
 {
   sed -n "1,/^$marker\$/p" "$template" | sed '$d'
+  printf '<script type="text/plain" id="data-viewer-version">%s</script>\n' "$version"
   if [[ -n "$meta" && -s "$meta" ]]; then
     printf '<script type="application/json" id="data-meta">'
     # JSON containing '</script' would end the element early; \u-escape '<'

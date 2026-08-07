@@ -18,12 +18,29 @@
   header h1 { font-size: 15px; margin: 0; }
   header .meta { color: var(--fg-dim); font-size: 12px; }
   header .meta a { color: var(--accent); text-decoration: none; }
+  header .viewer-meta { margin-left: auto; }
 
   #summary { padding: 8px 16px; border-bottom: 1px solid var(--border); background: var(--bg2); display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; }
   .chip { border: 1px solid var(--border); border-radius: 12px; padding: 1px 10px; cursor: pointer; background: var(--bg3); }
   .chip.ok { color: var(--ok); border-color: #2ea04366; }
   .chip.err { color: var(--err); border-color: #f8514966; }
   .chip.plain { cursor: default; color: var(--fg-dim); }
+  button.chip { color: var(--fg-dim); font: inherit; line-height: inherit; }
+  .chip.resource:hover, .chip.resource:focus-visible, .chip.resource[aria-expanded="true"] { color: var(--fg); border-color: var(--accent); outline: none; }
+
+  #usage-popup { position: fixed; z-index: 20; width: min(430px, calc(100vw - 24px)); max-height: min(480px, calc(100vh - 24px)); overflow: auto; background: var(--bg2); border: 1px solid var(--border); border-radius: 8px; box-shadow: 0 12px 36px #000a; }
+  #usage-popup[hidden] { display: none; }
+  .usage-head { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; background: var(--bg2); border-bottom: 1px solid var(--border); }
+  .usage-head strong { font-size: 12px; }
+  .usage-close { border: 0; padding: 0 2px; color: var(--fg-dim); background: none; cursor: pointer; font-size: 15px; }
+  .usage-list { padding: 4px 0; }
+  .usage-row { width: 100%; display: grid; grid-template-columns: 24px minmax(0, 1fr) auto; align-items: center; gap: 8px; padding: 7px 12px; border: 0; color: var(--fg); background: transparent; text-align: left; cursor: pointer; font: inherit; }
+  .usage-row:hover, .usage-row:focus-visible { background: #1c2431; outline: none; }
+  .usage-rank { color: var(--fg-dim); text-align: right; font: 11px var(--mono); }
+  .usage-label { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font: 12px var(--mono); }
+  .usage-values { color: var(--fg); white-space: nowrap; text-align: right; font: 11px var(--mono); }
+  .usage-values small { display: block; color: var(--fg-dim); font: inherit; }
+  .usage-empty { padding: 16px 12px; color: var(--fg-dim); text-align: center; }
 
   #toolbar { padding: 6px 16px; border-bottom: 1px solid var(--border); display: flex; flex-wrap: wrap; gap: 6px 16px; align-items: center; background: var(--bg); }
   #toolbar input[type=search] { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; width: 260px; }
@@ -71,6 +88,8 @@
   #detail .close { position: absolute; top: 8px; right: 10px; background: none; border: none; color: var(--fg-dim); font-size: 16px; cursor: pointer; }
   #detail section { padding: 10px 14px; border-bottom: 1px solid var(--border); }
   #detail h3 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--fg-dim); }
+  .resource-groups { display: grid; gap: 10px; }
+  .resource-group h4 { margin: 0 0 3px; color: var(--fg); font-size: 12px; font-weight: 600; }
   table.attrs { border-collapse: collapse; width: 100%; font-size: 12px; }
   table.attrs td { padding: 2px 8px 2px 0; vertical-align: top; font-family: var(--mono); word-break: break-all; }
   table.attrs td:first-child { color: var(--fg-dim); white-space: nowrap; }
@@ -101,8 +120,13 @@
 <header>
   <h1>Dagger trace</h1>
   <span class="meta" id="meta"></span>
+  <span class="meta viewer-meta"><a id="viewer-source" href="https://github.com/DanielHabenichtWork/dagger-otel-trace-action">GitHub</a></span>
 </header>
 <div id="summary" hidden></div>
+<div id="usage-popup" role="dialog" aria-modal="false" aria-labelledby="usage-title" hidden>
+  <div class="usage-head"><strong id="usage-title"></strong><button class="usage-close" type="button" aria-label="Close">✕</button></div>
+  <div class="usage-list"></div>
+</div>
 <div id="toolbar" hidden>
   <input type="search" id="search" placeholder="Filter spans by name…">
   <span id="matchcount"></span>
@@ -380,6 +404,14 @@ const METRIC_META = {
 };
 function metricInfo(name) {
   return METRIC_META[name] || { label: name.replace(/^dagger\.io\/metrics\./, "").replace(/\./g, " "), order: 99 };
+}
+const METRIC_GROUPS = [
+  { prefix: "dagger.io/metrics.cpustat.", label: "CPU", order: 10 },
+  { prefix: "dagger.io/metrics.iostat.", label: "I/O", order: 20 },
+  { prefix: "dagger.io/metrics.netstat.", label: "Network", order: 30 },
+];
+function metricGroup(name) {
+  return METRIC_GROUPS.find(group => name.startsWith(group.prefix)) || { label: "Other", order: 99 };
 }
 const fmtBytes = n => {
   if (!isFinite(n)) return "" + n;
@@ -773,15 +805,26 @@ function select(id) {
   const metrics = collectMetrics(span, true);
   if (metrics.size) {
     const subtree = !span.hasMetrics;
-    const rows = [...metrics.entries()]
-      .map(([name, { value, unit }]) => ({ name, value, unit, ...metricInfo(name) }))
+    const grouped = new Map();
+    for (const [name, { value, unit }] of metrics) {
+      const group = metricGroup(name);
+      if (!grouped.has(group.label)) grouped.set(group.label, { ...group, metrics: [] });
+      grouped.get(group.label).metrics.push({ name, value, unit, ...metricInfo(name) });
+    }
+    const groups = [...grouped.values()]
       .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label))
-      .map(m => `<tr><td>${esc(m.label)}</td><td class="mval">${esc(fmtMetric(m.value, m.unit))}</td>` +
-        `<td class="mraw">${esc(fmtCount(m.value))}${m.unit ? " " + esc(m.unit) : ""}</td></tr>`)
+      .map(group => {
+        const rows = group.metrics
+          .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label))
+          .map(m => `<tr><td>${esc(m.label)}</td><td class="mval">${esc(fmtMetric(m.value, m.unit))}</td>` +
+            `<td class="mraw">${esc(fmtCount(m.value))}${m.unit ? " " + esc(m.unit) : ""}</td></tr>`)
+          .join("");
+        return `<div class="resource-group"><h4>${esc(group.label)}</h4><table class="attrs">${rows}</table></div>`;
+      })
       .join("");
     const sec = document.createElement("section");
     sec.innerHTML = `<h3>Resource usage${subtree ? " <span style=\"font-weight:normal;text-transform:none;letter-spacing:0\">(subtree total)</span>" : ""}</h3>` +
-      `<table class="attrs">${rows}</table>`;
+      `<div class="resource-groups">${groups}</div>`;
     body.appendChild(sec);
   }
   // Every attribute is shown (nothing dropped); long/base64 values collapse.
@@ -799,18 +842,85 @@ function select(id) {
 }
 
 /* ---------- summary ---------- */
-// Run-wide resource totals for the header chip: sum each span's own gauges.
+const CPU_USAGE = "dagger.io/metrics.cpustat.usage";
+const NET_IN = "dagger.io/metrics.netstat.rx.bytes";
+const NET_OUT = "dagger.io/metrics.netstat.tx.bytes";
+const metricValue = (metrics, name) => metrics.has(name) ? metrics.get(name).value : 0;
+
+// Run-wide resource totals for the header chips: sum each span's own gauges.
 function totalUsage() {
   let cpu = 0, netIn = 0, netOut = 0, any = false;
   for (const mm of state.metricsBySpan.values()) {
-    const g = n => (mm.has(n) ? mm.get(n).value : 0);
-    cpu += g("dagger.io/metrics.cpustat.usage");
-    netIn += g("dagger.io/metrics.netstat.rx.bytes");
-    netOut += g("dagger.io/metrics.netstat.tx.bytes");
+    cpu += metricValue(mm, CPU_USAGE);
+    netIn += metricValue(mm, NET_IN);
+    netOut += metricValue(mm, NET_OUT);
     if (mm.size) any = true;
   }
   return any ? { cpu, netIn, netOut } : null;
 }
+
+// Metrics are attached to the exec span they describe. Rank those direct
+// values rather than subtree totals, which would count the same work once for
+// every ancestor in the tree.
+function rankedUsage(kind, limit = 10) {
+  const rows = [];
+  for (const [id, metrics] of state.metricsBySpan) {
+    const span = state.spans.get(id);
+    if (!span) continue;
+    const cpu = metricValue(metrics, CPU_USAGE);
+    const netIn = metricValue(metrics, NET_IN);
+    const netOut = metricValue(metrics, NET_OUT);
+    const value = kind === "cpu" ? cpu : netIn + netOut;
+    if (value > 0) rows.push({ span, value, cpu, netIn, netOut });
+  }
+  return rows
+    .sort((a, b) => b.value - a.value || a.span.start - b.span.start || a.span.label.localeCompare(b.span.label))
+    .slice(0, limit);
+}
+
+function gotoSpan(id) {
+  expandTo(id);
+  select(id);
+  const row = document.querySelector(`.row[data-id="${id}"]`);
+  if (row) row.scrollIntoView({ block: "center" });
+}
+
+function hideUsagePopup() {
+  const popup = document.getElementById("usage-popup");
+  popup.hidden = true;
+  document.querySelectorAll("[data-usage][aria-expanded=true]").forEach(el => el.setAttribute("aria-expanded", "false"));
+}
+
+function showUsagePopup(kind, anchor) {
+  const popup = document.getElementById("usage-popup");
+  const rows = rankedUsage(kind);
+  document.getElementById("usage-title").textContent = kind === "cpu" ? "Most CPU-intensive traces" : "Most network-intensive traces";
+  popup.querySelector(".usage-list").innerHTML = rows.length ? rows.map((r, i) => {
+    const values = kind === "cpu"
+      ? `${fmtMicros(r.cpu)}<small>${fmtDur(r.span.end - r.span.start)} elapsed</small>`
+      : `${fmtBytes(r.value)}<small>↓${fmtBytes(r.netIn)} · ↑${fmtBytes(r.netOut)}</small>`;
+    return `<button class="usage-row" type="button" data-goto="${r.span.id}" title="${esc(r.span.label)}">` +
+      `<span class="usage-rank">${i + 1}</span><span class="usage-label">${esc(r.span.label)}</span>` +
+      `<span class="usage-values">${values}</span></button>`;
+  }).join("") : `<div class="usage-empty">No ${kind === "cpu" ? "CPU" : "network"} usage recorded.</div>`;
+
+  document.querySelectorAll("[data-usage]").forEach(el => el.setAttribute("aria-expanded", String(el === anchor)));
+  popup.hidden = false;
+  popup.style.visibility = "hidden";
+  const a = anchor.getBoundingClientRect();
+  const p = popup.getBoundingClientRect();
+  const left = Math.max(12, Math.min(a.left, window.innerWidth - p.width - 12));
+  const below = a.bottom + 8;
+  const top = below + p.height <= window.innerHeight - 12 ? below : Math.max(12, a.top - p.height - 8);
+  popup.style.left = `${left}px`;
+  popup.style.top = `${top}px`;
+  popup.style.visibility = "visible";
+  popup.querySelectorAll("[data-goto]").forEach(row => row.addEventListener("click", () => {
+    hideUsagePopup();
+    gotoSpan(row.dataset.goto);
+  }));
+}
+
 function renderSummary() {
   const el = document.getElementById("summary");
   el.hidden = false;
@@ -820,7 +930,10 @@ function renderSummary() {
   const chips = [];
   chips.push(`<span class="chip plain">${spans.length} spans · ${fmtDur(state.maxEnd - state.minStart)} total</span>`);
   const usage = totalUsage();
-  if (usage) chips.push(`<span class="chip plain" title="Engine resource usage across all execs">⚡ CPU ${fmtMicros(usage.cpu)} · net ↓${fmtBytes(usage.netIn)} ↑${fmtBytes(usage.netOut)}</span>`);
+  if (usage) {
+    chips.push(`<button class="chip resource" type="button" data-usage="cpu" aria-haspopup="dialog" aria-expanded="false" title="Show traces with the highest CPU usage">⚡ CPU ${fmtMicros(usage.cpu)}</button>`);
+    chips.push(`<button class="chip resource" type="button" data-usage="network" aria-haspopup="dialog" aria-expanded="false" title="Show traces with the most network traffic">⇅ Network ↓${fmtBytes(usage.netIn)} ↑${fmtBytes(usage.netOut)}</button>`);
+  }
   for (const c of checks.sort((a, b) => a.start - b.start)) {
     chips.push(`<span class="chip ${c.checkPassed === false ? "err" : "ok"}" data-goto="${c.id}">${c.checkPassed === false ? "✗" : "✓"} ${esc(c.checkName)}</span>`);
   }
@@ -829,12 +942,14 @@ function renderSummary() {
     chips.push(`<span class="chip err" data-goto="${e.id}">⚠ ${esc(e.label.slice(0, 60))}</span>`);
   }
   el.innerHTML = chips.join("");
+  el.querySelectorAll("[data-usage]").forEach(chip => chip.addEventListener("click", e => {
+    e.stopPropagation();
+    const wasOpen = chip.getAttribute("aria-expanded") === "true";
+    hideUsagePopup();
+    if (!wasOpen) showUsagePopup(chip.dataset.usage, chip);
+  }));
   el.querySelectorAll("[data-goto]").forEach(chip => chip.addEventListener("click", () => {
-    const id = chip.dataset.goto;
-    expandTo(id);
-    select(id);
-    const row = document.querySelector(`.row[data-id="${id}"]`);
-    if (row) row.scrollIntoView({ block: "center" });
+    gotoSpan(chip.dataset.goto);
   }));
 }
 
@@ -863,17 +978,57 @@ function loadError(e) {
   el.textContent = "Failed to load trace data: " + (e && e.message || e);
 }
 
+function safeHttpUrl(value) {
+  try {
+    const url = new URL(value);
+    return url.protocol === "https:" || url.protocol === "http:" ? url.href : "";
+  } catch (e) {
+    return "";
+  }
+}
+function pathPart(value) {
+  return String(value).split("/").map(encodeURIComponent).join("/");
+}
+function metaLink(label, url) {
+  const safe = safeHttpUrl(url);
+  return safe ? `<a href="${esc(safe)}">${esc(String(label))}</a>` : esc(String(label));
+}
+function viewerReleaseUrl(repoUrl, version) {
+  return `${safeHttpUrl(repoUrl).replace(/\/$/, "")}/releases/tag/${encodeURIComponent(`v${version}`)}`;
+}
+function metaHtml(m) {
+  let repoUrl = safeHttpUrl(m.repoUrl);
+  if (!repoUrl && m.repo && String(m.repo).includes("/")) {
+    let origin = "https://github.com";
+    try { if (m.runUrl) origin = new URL(m.runUrl).origin; } catch (e) { /* use github.com */ }
+    repoUrl = safeHttpUrl(`${origin}/${pathPart(m.repo)}`);
+  }
+  repoUrl = repoUrl.replace(/\/$/, "");
+
+  const parts = [];
+  if (m.repo) parts.push(metaLink(m.repo, repoUrl));
+  if (m.ref) parts.push(metaLink(m.ref, repoUrl && `${repoUrl}/tree/${pathPart(m.ref)}`));
+  if (m.sha) parts.push(metaLink(String(m.sha).slice(0, 10), repoUrl && `${repoUrl}/commit/${encodeURIComponent(m.sha)}`));
+  if (m.runUrl) parts.push(metaLink("workflow run", m.runUrl));
+  if (m.date) parts.push(esc(String(m.date)));
+  return parts.join(" · ");
+}
 function applyMeta(m) {
   document.title = `Dagger trace — ${m.title || ""}`;
-  document.getElementById("meta").innerHTML =
-    [m.repo && esc(m.repo), m.ref && esc(m.ref), m.sha && esc(m.sha.slice(0, 10)), m.date && esc(m.date)].filter(Boolean).join(" · ") +
-    (m.runUrl ? ` · <a href="${esc(m.runUrl)}">workflow run</a>` : "");
+  document.getElementById("meta").innerHTML = metaHtml(m);
 }
 function ingestBatches(batches) {
   for (const b of batches) if (b.__meta__) applyMeta(b.__meta__);
   autoDetectIngest(batches);
 }
 async function loadEmbedded() {
+  const versionEl = document.getElementById("data-viewer-version");
+  if (versionEl) {
+    const version = versionEl.textContent.trim();
+    const source = document.getElementById("viewer-source");
+    source.textContent = `viewer v${version}`;
+    source.href = viewerReleaseUrl(source.href, version);
+  }
   const metaEl = document.getElementById("data-meta");
   if (metaEl) {
     try { applyMeta(JSON.parse(metaEl.textContent)); } catch (e) { /* meta is optional */ }
@@ -929,6 +1084,11 @@ async function loadFiles(files) {
 }
 
 document.getElementById("dclose").addEventListener("click", () => { document.getElementById("detail").classList.remove("open"); state.selected = null; render(); });
+document.querySelector("#usage-popup .usage-close").addEventListener("click", hideUsagePopup);
+document.addEventListener("click", e => { if (!e.target.closest("#usage-popup")) hideUsagePopup(); });
+document.addEventListener("keydown", e => { if (e.key === "Escape") hideUsagePopup(); });
+window.addEventListener("resize", hideUsagePopup);
+document.getElementById("tree").addEventListener("scroll", hideUsagePopup, { passive: true });
 document.getElementById("search").addEventListener("input", e => { state.query = e.target.value.trim(); matchCache.clear(); render(); });
 for (const id of ["f-internal", "f-encapsulated", "f-cached"]) document.getElementById(id).addEventListener("change", render);
 document.getElementById("expandall").addEventListener("click", () => { for (const id of state.spans.keys()) state.expanded.add(id); render(); });

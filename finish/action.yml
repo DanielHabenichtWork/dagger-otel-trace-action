@@ -49,6 +49,7 @@ runs:
         jq -n \
           --arg title "${{ inputs.title }}" \
           --arg repo "$GITHUB_REPOSITORY" \
+          --arg repoUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY" \
           --arg ref "${GITHUB_HEAD_REF:-$GITHUB_REF_NAME}" \
           --arg sha "$GITHUB_SHA" \
           --arg date "$(date -u +%FT%TZ)" \
