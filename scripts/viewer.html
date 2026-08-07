@@ -87,6 +87,8 @@
   #detail .close { position: absolute; top: 8px; right: 10px; background: none; border: none; color: var(--fg-dim); font-size: 16px; cursor: pointer; }
   #detail section { padding: 10px 14px; border-bottom: 1px solid var(--border); }
   #detail h3 { margin: 0 0 6px; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--fg-dim); }
+  .resource-groups { display: grid; gap: 10px; }
+  .resource-group h4 { margin: 0 0 3px; color: var(--fg); font-size: 12px; font-weight: 600; }
   table.attrs { border-collapse: collapse; width: 100%; font-size: 12px; }
   table.attrs td { padding: 2px 8px 2px 0; vertical-align: top; font-family: var(--mono); word-break: break-all; }
   table.attrs td:first-child { color: var(--fg-dim); white-space: nowrap; }
@@ -401,6 +403,14 @@ const METRIC_META = {
 };
 function metricInfo(name) {
   return METRIC_META[name] || { label: name.replace(/^dagger\.io\/metrics\./, "").replace(/\./g, " "), order: 99 };
+}
+const METRIC_GROUPS = [
+  { prefix: "dagger.io/metrics.cpustat.", label: "CPU", order: 10 },
+  { prefix: "dagger.io/metrics.iostat.", label: "I/O", order: 20 },
+  { prefix: "dagger.io/metrics.netstat.", label: "Network", order: 30 },
+];
+function metricGroup(name) {
+  return METRIC_GROUPS.find(group => name.startsWith(group.prefix)) || { label: "Other", order: 99 };
 }
 const fmtBytes = n => {
   if (!isFinite(n)) return "" + n;
@@ -794,15 +804,26 @@ function select(id) {
   const metrics = collectMetrics(span, true);
   if (metrics.size) {
     const subtree = !span.hasMetrics;
-    const rows = [...metrics.entries()]
-      .map(([name, { value, unit }]) => ({ name, value, unit, ...metricInfo(name) }))
+    const grouped = new Map();
+    for (const [name, { value, unit }] of metrics) {
+      const group = metricGroup(name);
+      if (!grouped.has(group.label)) grouped.set(group.label, { ...group, metrics: [] });
+      grouped.get(group.label).metrics.push({ name, value, unit, ...metricInfo(name) });
+    }
+    const groups = [...grouped.values()]
       .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label))
-      .map(m => `<tr><td>${esc(m.label)}</td><td class="mval">${esc(fmtMetric(m.value, m.unit))}</td>` +
-        `<td class="mraw">${esc(fmtCount(m.value))}${m.unit ? " " + esc(m.unit) : ""}</td></tr>`)
+      .map(group => {
+        const rows = group.metrics
+          .sort((a, b) => a.order - b.order || a.label.localeCompare(b.label))
+          .map(m => `<tr><td>${esc(m.label)}</td><td class="mval">${esc(fmtMetric(m.value, m.unit))}</td>` +
+            `<td class="mraw">${esc(fmtCount(m.value))}${m.unit ? " " + esc(m.unit) : ""}</td></tr>`)
+          .join("");
+        return `<div class="resource-group"><h4>${esc(group.label)}</h4><table class="attrs">${rows}</table></div>`;
+      })
       .join("");
     const sec = document.createElement("section");
     sec.innerHTML = `<h3>Resource usage${subtree ? " <span style=\"font-weight:normal;text-transform:none;letter-spacing:0\">(subtree total)</span>" : ""}</h3>` +
-      `<table class="attrs">${rows}</table>`;
+      `<div class="resource-groups">${groups}</div>`;
     body.appendChild(sec);
   }
   // Every attribute is shown (nothing dropped); long/base64 values collapse.
