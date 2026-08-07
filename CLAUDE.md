@@ -82,6 +82,7 @@ dagger step ──OTLP/protobuf──> otlp-receiver.mjs (Node) ──> <data-di
 | `scripts/finish.sh` | stop the receiver (SIGTERM by pid from `receiver.json`); call `bundle.sh` |
 | `scripts/bundle.sh` | gzip+base64-embed `traces.jsonl`/`logs.jsonl`/`meta.json` into `viewer.html` at the `<!--__DAGGER_TRACE_DATA__-->` marker |
 | `test/otlp-receiver.test.mjs` | `node:test` harness: receiver output == collector output, against `test/fixtures/{dagger-check,dagger-metrics}` (run by `dagger check`'s `test`) |
+| `test/viewer-effect-merge.test.mjs` | `node:test`: extracts the viewer's model block and pins passthrough/effect handling — `mergeEffectSpans` (effect-span runtime/error folds onto the linked call span) and `visibleChildren` passthrough surfacing (long uncovered self-time → own `dagger internal` row; short/merged stay spliced) |
 | `scripts/viewer.html` | the entire viewer — **where almost all real work happens** |
 
 Composite steps reference sibling scripts via `$GITHUB_ACTION_PATH/../scripts/`
@@ -110,8 +111,35 @@ that way. Rough map (line numbers drift; grep for the names):
   - `Literal`: f7 = string, f8 = list, f3 = bool, f5 = int, f4 = enum name,
     f1 = reference digest (`xxh3:…`), f10 = metadata blob, f9 = object
 - **`ingestTraces`** — builds the span model. Each span carries `name` (raw
-  dagql), `label` (decoded), `call` (decoded op+args), and `search` (label+name,
-  lowercased). Use `label` for display, `search` for filtering.
+  dagql), `label` (decoded), `call` (decoded op+args), `links` (OTLP span links
+  as `{id, purpose}`), and `search` (label+name, lowercased). Use `label` for
+  display, `search` for filtering.
+- **`mergeEffectSpans`** (run first inside `buildTree`) — Dagger models a
+  lazily-built dagql call as **two** spans: the call span itself
+  (`dag.pending`, ~0 duration, but it carries the logs + decoded label) and a
+  separate **`resume <op>`** *effect* span that holds the real execution time.
+  The effect span is `ui.passthrough` and is a **leaf**, so `visibleChildren`
+  (which replaces passthrough spans with their children) would silently drop it
+  *and its duration* — making e.g. `exec node --test` read ~0.1ms while the real
+  292ms vanished. The effect span **links** back to the call span it runs (the
+  link with **no** `dagger.io/link.purpose`) plus the span(s) that caused the
+  resume (`link.purpose="cause"`). `mergeEffectSpans` folds each passthrough-leaf
+  effect span's interval (union) + error status onto its non-cause link target,
+  so the call span reflects real runtime — mirroring how the Dagger TUI reunites
+  the pair. Pinned by `test/viewer-effect-merge.test.mjs`. (A merged call span
+  can end after its earlier-closing ancestors; that's truthful — the effect
+  resumes after the pending call's tree closed — and the absolute-positioned
+  waterfall bars render it fine.)
+- **`visibleChildren` passthrough surfacing** — passthrough spans are normally
+  spliced away (children promoted, mirroring the TUI). Exception: a passthrough
+  span whose interval is largely **not covered by any visible descendant** — e.g.
+  a long `POST /query` while the engine builds a container, which otherwise leaves
+  an unexplained gap in the waterfall — is surfaced as its own **collapsible**
+  row badged `dagger internal`, when its uncovered self-time ≥ `PASSTHROUGH_MIN_MS`
+  (200ms). `coveredMs` computes the union of the spliced descendants' intervals
+  clipped to the span. Short wrappers and spans already folded by
+  `mergeEffectSpans` (`span.merged`) stay spliced/hidden, so sub-ms query noise
+  never shows. Pinned by `test/viewer-effect-merge.test.mjs`.
 - **`ingestLogs`** — log records keyed by span id; `t` is kept in **nanoseconds**
   (spans convert to ms; mind the unit when comparing).
 - **`ingestMetrics` / `collectMetrics` / `METRIC_META`** — the engine's per-exec
@@ -122,7 +150,11 @@ that way. Rough map (line numbers drift; grep for the names):
   unit (`bytes`→KB/MB, `us`→ms/s, else count); unknown metric names fall back to a
   prettified label. Surfaced as a per-row **usage** badge, a *Resource usage*
   detail section, and a run-total chip in the summary header.
-- **`render` / `addRow`** — the span waterfall tree.
+- **`render` / `addRow`** — the span waterfall tree. Depth indent is a dedicated
+  `.indent` flex item, **not** row `padding-left`: the `.track` is a fixed
+  fraction (30%) of the row, so padding would shrink/shift it per depth and make
+  the time axis drift a few px per nesting level (equal timestamps then misalign
+  across depths). Keep the indent off the row box.
 - **`select`** — the detail panel: Error, Output (with timing), Call (decoded
   op+args), and a Span table showing **every** attribute (long/base64 values
   collapse behind `<details>` — nothing is dropped).

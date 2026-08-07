@@ -40,6 +40,7 @@
   .row:hover { background: #1c2431; }
   .row.selected { background: #1f3a5f; }
   .row.dimmed { opacity: 0.35; }
+  .row .indent { flex: none; }
   .row .twisty { width: 16px; flex: none; text-align: center; color: var(--fg-dim); font-size: 10px; }
   .row .name { overflow: hidden; text-overflow: ellipsis; font-family: var(--mono); font-size: 12px; }
   .row.err .name { color: var(--err); }
@@ -50,6 +51,7 @@
   .badge.errdeep { color: var(--err); border: 1px solid #f8514955; }
   .badge.logs { color: var(--fg-dim); border: 1px solid var(--border); }
   .badge.metrics { color: var(--warn); border: 1px solid #d2992255; }
+  .badge.internal { color: var(--fg-dim); border: 1px dashed var(--border); }
   table.attrs td.mval { color: var(--fg); white-space: nowrap; text-align: right; width: 1%; }
   table.attrs td.mraw { color: var(--fg-dim); white-space: nowrap; }
   .badge.check-ok { color: var(--ok); border: 1px solid #2ea04366; }
@@ -315,6 +317,15 @@ function ingestTraces(batches) {
             encapsulated: !!attrs["dagger.io/ui.encapsulated"],
             checkName: attrs["dagger.io/check.name"],
             checkPassed: attrs["dagger.io/check.passed"],
+            // OTLP span links. Dagger emits a separate "resume <op>" effect span
+            // (ui.passthrough) for the actual execution of a lazily-built dagql
+            // call; it links back to the call span it executes (no link.purpose)
+            // plus the span(s) that caused the resume (link.purpose="cause").
+            links: (s.links || []).map(l => ({
+              id: l.spanId,
+              purpose: attrsToObj(l.attributes)["dagger.io/link.purpose"] || "",
+            })),
+            merged: false, // set by mergeEffectSpans on effect spans it folds away
             children: [],
           };
           const prev = state.spans.get(span.id);
@@ -429,7 +440,40 @@ function collectMetrics(span, deep) {
   visit(span);
   return out;
 }
+// Dagger models a lazily-built dagql call as two spans: the call span itself
+// (dag.pending, ~0 duration, but carries the logs/label) and a separate
+// "resume <op>" effect span that holds the real execution time. The effect span
+// is marked ui.passthrough, so visibleChildren would replace it with its
+// children — and since it's a leaf, that silently drops it *and its duration*.
+// Fold each such passthrough-leaf effect span's interval + error status onto the
+// call span it links to (the non-"cause" link), so the call span reflects real
+// runtime. Mirrors how the Dagger TUI reunites the pair via span links.
+// Idempotent: min/max/status-widen can run more than once safely.
+function mergeEffectSpans() {
+  const hasChildren = new Set();
+  for (const s of state.spans.values()) if (s.parent) hasChildren.add(s.parent);
+  for (const span of state.spans.values()) {
+    // Only passthrough *leaves* with links are effect spans; passthrough
+    // wrappers (POST /query, checks) have real children and no links, and are
+    // handled by visibleChildren splicing their children in.
+    if (!span.passthrough || !span.links.length || hasChildren.has(span.id)) continue;
+    const link = span.links.find(l => l.purpose !== "cause");
+    const target = link && state.spans.get(link.id);
+    if (!target) continue;
+    target.start = Math.min(target.start, span.start);
+    target.end = Math.max(target.end, span.end);
+    if (span.statusCode === 2 && target.statusCode !== 2) {
+      target.statusCode = 2;
+      target.statusMsg = target.statusMsg || span.statusMsg;
+    }
+    // folded onto its call span: stays hidden even when its runtime would
+    // otherwise make surfacePassthrough keep it (see visibleChildren).
+    span.merged = true;
+  }
+}
+
 function buildTree() {
+  mergeEffectSpans();
   state.roots = [];
   for (const span of state.spans.values()) {
     span.children = [];
@@ -474,16 +518,44 @@ function filters() {
     cached: document.getElementById("f-cached").checked,
   };
 }
+// A passthrough span whose own interval is largely NOT covered by any visible
+// descendant is engine/SDK-internal work with no user-facing span of its own
+// (e.g. a long POST /query while the engine builds a container). Below this many
+// ms of uncovered self-time we keep the Dagger-TUI default (splice it away);
+// at/above it we surface the span as its own collapsible "dagger internal" row
+// so the otherwise-unexplained gap in the waterfall is visible and inspectable.
+const PASSTHROUGH_MIN_MS = 200;
+// Total length of [start,end] intervals unioned (overlaps counted once), clipped
+// to [lo,hi].
+function coveredMs(intervals, lo, hi) {
+  const clipped = intervals
+    .map(([s, e]) => [Math.max(s, lo), Math.min(e, hi)])
+    .filter(([s, e]) => e > s)
+    .sort((a, b) => a[0] - b[0]);
+  let covered = 0, curEnd = -Infinity;
+  for (const [s, e] of clipped) {
+    const start = Math.max(s, curEnd);
+    if (e > start) covered += e - start;
+    curEnd = Math.max(curEnd, e);
+  }
+  return covered;
+}
 // Mirrors the Dagger TUI defaults: internal spans hidden, passthrough spans
-// replaced by their children, encapsulated spans shown only when the parent failed.
+// replaced by their children, encapsulated spans shown only when the parent
+// failed. Exception: a passthrough span with significant uncovered self-time is
+// surfaced (see PASSTHROUGH_MIN_MS).
 function visibleChildren(span, f, parentFailed) {
   const out = [];
   for (const c of span ? span.children : state.roots) {
     if (c.internal && !f.internal) continue;
     if (c.encapsulated && !f.encapsulated && !parentFailed) continue;
     if (c.cached && !f.cached) continue;
-    if (c.passthrough) out.push(...visibleChildren(c, f, c.statusCode === 2 || parentFailed));
-    else out.push(c);
+    if (c.passthrough) {
+      const sub = visibleChildren(c, f, c.statusCode === 2 || parentFailed);
+      const uncovered = (c.end - c.start) - coveredMs(sub.map(s => [s.start, s.end]), c.start, c.end);
+      if (!c.merged && uncovered >= PASSTHROUGH_MIN_MS) out.push(c);
+      else out.push(...sub);
+    } else out.push(c);
   }
   return out.sort((a, b) => a.start - b.start);
 }
@@ -514,10 +586,13 @@ function render() {
     const open = state.expanded.has(span.id) || (q && subtreeMatches(span, q));
     const row = document.createElement("div");
     row.className = "row" + (span.statusCode === 2 ? " err" : "") + (span.cached ? " cached" : "") + (q && !isMatch ? " dimmed" : "") + (state.selected === span.id ? " selected" : "");
-    row.style.paddingLeft = depth * 16 + 6 + "px";
     const left = ((span.start - state.minStart) / total * 100).toFixed(3);
     const width = (Math.max(span.end - span.start, 0) / total * 100).toFixed(3);
+    // Depth indent is its own flex item (not row padding) so the fixed-fraction
+    // .track keeps the same geometry at every depth — otherwise the waterfall's
+    // time axis shifts a few px per level and equal timestamps misalign.
     row.innerHTML =
+      `<span class="indent" style="width:${depth * 16 + 6}px"></span>` +
       `<span class="twisty">${kids.length ? (open ? "▾" : "▸") : ""}</span>` +
       `<span class="name">${esc(span.label)}</span>` +
       (span.checkName ? `<span class="badge ${span.checkPassed === false ? "check-fail" : "check-ok"}">${span.checkPassed === false ? "✗ FAILED" : "✓ CHECK"}</span>` : "") +
@@ -525,6 +600,7 @@ function render() {
       (span.cached ? `<span class="badge cached">CACHED</span>` : "") +
       (span.hasLogs ? `<span class="badge logs">output</span>` : "") +
       (span.hasMetrics ? `<span class="badge metrics">usage</span>` : "") +
+      (span.passthrough ? `<span class="badge internal" title="Dagger/engine-internal time with no user span of its own — expand to inspect">dagger internal</span>` : "") +
       `<span class="spacer"></span><span class="dur">${fmtDur(span.end - span.start)}</span>` +
       `<span class="track"><span class="bar" style="left:${left}%;width:${width}%"></span></span>`;
     row.dataset.id = span.id;
