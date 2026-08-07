@@ -148,6 +148,20 @@
   .gnode.source rect { stroke: var(--warn); stroke-width: 2; }
   .gnode.hit text, .gnode.source text { fill: var(--fg); }
   .gnode.dim { opacity: .22; }
+  /* filesystem tree rows in the left lane */
+  .gtreerow { cursor: pointer; }
+  .gtreerow rect { fill: #14202e; stroke: var(--border); stroke-width: 1; }
+  .gtreerow.dir rect { fill: #182430; stroke: #3d5a80aa; }
+  .gtreerow:hover rect { stroke: var(--accent); }
+  .gtreerow .gtree-name { fill: var(--fg); font: 11px var(--mono); }
+  .gtreerow.dir .gtree-name { fill: var(--accent); }
+  .gtreerow .gprop { fill: var(--fg-dim); font: 9px var(--mono); }
+  .gtreerow.err rect { stroke: var(--err); }
+  .gtreerow.cached .gtree-name { fill: var(--fg-dim); }
+  .gtreerow.sel rect { stroke: var(--accent); stroke-width: 2; }
+  .gtreerow.hit rect { stroke: var(--ok); stroke-width: 1.6; }
+  .gtreerow.source rect { stroke: var(--warn); stroke-width: 2; }
+  .gtreerow.dim { opacity: .22; }
   .graph-only[hidden], .tree-only[hidden] { display: none; }
   #toolbar select { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 2px 6px; }
   #impact-wrap { margin-left: 8px; }
@@ -182,6 +196,8 @@
   </span>
   <span class="graph-only" hidden>
     <label>focus <select id="graph-focus"><option value="">all checks</option></select></label>
+    <label title="Highlight the repo files whose change triggered the work Dagger actually ran (non-cached)"><input type="checkbox" id="graph-cache"> trigger files</label>
+    <label title="Show every dagql node, including the plumbing folded away by default"><input type="checkbox" id="graph-raw"> raw ops</label>
     <span id="impact-wrap"><input type="search" id="impact-path" placeholder="file path → highlight rebuilds" style="width:240px"><span id="impact-count"></span><button id="impact-clear" type="button" style="margin-left:8px">clear</button></span>
   </span>
 </div>
@@ -364,6 +380,9 @@ const state = {
   graph: null,    // cached {nodes, edges, width, height} from buildGraph()
   impact: null,   // {sources, related} highlight for a file-change, or null
   graphFocus: "", // graph: focus one check/function group ("" = all)
+  graphRaw: false, // graph: show spliced-away plumbing/property nodes
+  graphCacheTrigger: false, // graph: highlight files that triggered non-cached work
+
   defaultView: null, // meta.defaultView: open in "graph" when the producer opts in
 };
 
@@ -1021,8 +1040,19 @@ function renderSummary() {
    highlight: source nodes + their connected subgraph lit, everything else dimmed.
    File-impact granularity is whole content-addressed directory reads, so it
    over-approximates (it can't tell a changed file is a semantic no-op). */
-const GNODE_W = 210, GNODE_H = 22, GCOL = 250, GROW = 30, GPAD = 24;
-const GLANE_W = 230, GLANE_GAP = 70, GSEC_HEAD = 26, GSEC_GAP = 26, GTOP = 34;
+const GNODE_W = 210, GNODE_H = 22, GCOL = 250, GROW = 26, GPAD = 24;
+const GLANE_W = 260, GLANE_GAP = 70, GSEC_HEAD = 26, GSEC_GAP = 26, GTOP = 34, GINDENT = 14;
+
+// dagql plumbing folded away by default (spliced: their inputs reconnect straight
+// to their outputs, so the graph stays connected but far smaller). Toggle with the
+// "raw ops" checkbox. PROP ops are file/dir metadata reads — hidden from the graph
+// and instead listed as properties on the file/folder they read.
+const GRAPH_PROP_OPS = new Set(["digest", "contents", "name", "size", "id", "sync", "entries", "exists", "glob"]);
+const GRAPH_HIDE_OPS = new Set(["_implementationScoped", "withObject", "asModule", "asModuleSource",
+  "moduleName", "moduleOriginalName", "moduleTypes", "moduleSource", "contextDirectory", "sourceSubpath",
+  "sourceRootSubpath", "sdk", "typescriptSdk", "checks", "check", "run", "list", "debug", "findUp",
+  "_clientFilesyncMirror", "_sshAuthSocket", "currentWorkspace", "withDescription", "host", "module",
+  "source", "passed", "asModuleSource"]);
 
 const gArgs = n => { const by = {}; if (n.span.call) for (const a of n.span.call.args) by[a.name] = a.value; return by; };
 // file reference = a node that names a path (host read / directory / file
@@ -1031,12 +1061,13 @@ function gKind(n) {
   const op = n.span.call && n.span.call.op, name = n.span.name || "";
   if (op === "cacheVolume" || /(^|\.)cacheVolume\b/.test(name)) return "cache";
   if (/^Host\.(directory|file)\b/.test(name)) return "file";
-  if ((op === "directory" || op === "file" || op === "exists" || op === "withNewFile") && gArgs(n).path != null) return "file";
+  if ((op === "directory" || op === "file" || op === "withNewFile") && gArgs(n).path != null) return "file";
   return "op";
 }
-// Reconstruct a real relative path by walking the chain of path-addressed reads:
-// Host.directory is the repo root (""), each Directory.directory/file appends its
-// path arg. Absolute (container) paths pass through unchanged. Best-effort.
+function gIsDir(n) { const op = n.span.call && n.span.call.op; return /^Host\.directory/.test(n.span.name) || op === "directory"; }
+// Reconstruct a real path by walking the chain of path-addressed reads: Host.directory
+// is the repo root (""), each Directory.directory/file appends its path arg. Absolute
+// (container) paths pass through. Uses raw inputs (rin) — runs before splicing.
 function gPath(n, memo) {
   if (memo.has(n)) return memo.get(n);
   memo.set(n, null); // cycle guard
@@ -1048,7 +1079,9 @@ function gPath(n, memo) {
     const raw = String(by.path);
     if (raw.startsWith("/")) p = raw;
     else {
-      const base = n.inputs.map(i => i.kind === "file" ? gPath(i, memo) : null).find(x => x != null);
+      // inherit the base from a directory input only — a file can't be a parent,
+      // so withNewFile/withFile siblings don't nest under each other.
+      const base = n.rin.map(i => i.kind === "file" && gIsDir(i) ? gPath(i, memo) : null).find(x => x != null);
       const rel = raw.replace(/^\.\//, "");
       p = base == null ? rel : base === "" ? rel : base + "/" + rel;
     }
@@ -1064,7 +1097,37 @@ function gGroup(n) {
   return "";
 }
 
+// ---- filesystem tree from the reconstructed paths (merges shared folders) ----
+function gTreeInsert(root, fn) {
+  const isDir = gIsDir(fn);
+  const p = fn.path;
+  let segs;
+  if (p == null) segs = [fn.display];
+  else { const s = p.replace(/^\//, ""); segs = s === "" ? [] : s.split("/"); }
+  if (!segs.length) { root.digestNodes.push(fn); for (const x of fn.props) root.props.add(x); return; } // repo-root host read
+  let cur = root;
+  segs.forEach((seg, i) => {
+    if (!cur.kids.has(seg)) cur.kids.set(seg, { seg, isDir: i < segs.length - 1 || isDir, kids: new Map(), digestNodes: [], props: new Set() });
+    cur = cur.kids.get(seg);
+    if (i < segs.length - 1) cur.isDir = true;
+  });
+  cur.digestNodes.push(fn);
+  if (isDir) cur.isDir = true;
+  for (const x of fn.props) cur.props.add(x);
+}
+function gTreeLayout(root, out) {
+  const walk = (node, depth, prefix) => {
+    node.depth = depth;
+    node.fullPath = depth === 0 ? "/" : prefix + node.seg + (node.isDir ? "/" : "");
+    out.push(node);
+    const kids = [...node.kids.values()].sort((a, b) => (b.isDir - a.isDir) || a.seg.localeCompare(b.seg));
+    for (const k of kids) walk(k, depth + 1, depth === 0 ? "/" : node.fullPath);
+  };
+  walk(root, 0, "");
+}
+
 function buildGraph() {
+  const raw = state.graphRaw;
   // One node per digest; prefer a span that carries a decoded call over a bare
   // pending/effect span so the label + args are populated.
   const byDigest = new Map();
@@ -1072,57 +1135,80 @@ function buildGraph() {
     const dg = s.attrs["dagger.io/dag.digest"];
     if (!dg) continue;
     const prev = byDigest.get(dg);
-    if (!prev || (!prev.span.call && s.call)) byDigest.set(dg, { digest: dg, span: s, inputs: [], outputs: [] });
+    if (!prev || (!prev.span.call && s.call)) byDigest.set(dg, { digest: dg, span: s, rin: [], rout: [] });
   }
-  const nodes = [...byDigest.values()];
-  const edges = [];
-  for (const n of nodes) {
+  const all = [...byDigest.values()];
+  for (const n of all) {
     const ins = n.span.attrs["dagger.io/dag.inputs"];
     if (!Array.isArray(ins)) continue;
-    for (const dg of ins) {
-      const src = byDigest.get(dg);
-      if (src && src !== n) { n.inputs.push(src); src.outputs.push(n); edges.push([src, n]); }
-    }
+    for (const dg of ins) { const src = byDigest.get(dg); if (src && src !== n) { n.rin.push(src); src.rout.push(n); } }
   }
-  // classify, reconstruct paths, assign groups
-  for (const n of nodes) n.kind = gKind(n);
+  // classify + reconstruct paths (before splicing; path walk uses raw inputs)
   const pmemo = new Map();
-  for (const n of nodes) {
+  for (const n of all) { n.op = n.span.call && n.span.call.op; n.kind = gKind(n); }
+  for (const n of all) if (n.kind === "file") { n.props = new Set(); n.path = gPath(n, pmemo); }
+  // property ops fold onto their file input; property + plumbing ops are spliced
+  for (const n of all) if (n.kind === "op" && GRAPH_PROP_OPS.has(n.op)) n.kind = "prop";
+  for (const n of all) n.hidden = !raw && (n.kind === "prop" || (n.kind === "op" && GRAPH_HIDE_OPS.has(n.op)));
+  if (!raw) for (const n of all) if (n.kind === "prop") {
+    const fin = n.rin.find(i => i.kind === "file");
+    if (fin) fin.props.add(n.op);
+  }
+  // visible adjacency: reconnect each visible node to its nearest visible inputs
+  const visible = all.filter(n => !n.hidden);
+  for (const n of visible) { n.inputs = []; n.outputs = []; }
+  const collect = (n, acc, seen) => {
+    for (const i of n.rin) {
+      if (i.hidden) { if (!seen.has(i)) { seen.add(i); collect(i, acc, seen); } }
+      else acc.add(i);
+    }
+  };
+  const edges = [];
+  for (const n of visible) {
+    const acc = new Set();
+    collect(n, acc, new Set());
+    for (const s of acc) { n.inputs.push(s); s.outputs.push(n); edges.push([s, n]); }
+  }
+  // group + display
+  for (const n of visible) {
     n.group = n.kind === "op" ? gGroup(n) : "";
     if (n.kind === "file") {
-      const p = gPath(n, pmemo);
-      n.path = p;
-      if (/^Host\./.test(n.span.name)) {
-        const spec = hostSpec(n);
-        n.display = spec && spec.include.length ? "repo: " + spec.include.join(", ")
-          : spec && spec.exclude.length ? "repo root (filtered)" : "repo root";
-      } else n.display = p || n.span.label;
-    } else {
-      n.display = n.span.label;
-    }
+      if (/^Host\./.test(n.span.name)) { const spec = hostSpec(n); n.display = spec && spec.include.length ? "repo: " + spec.include.join(", ") : spec && spec.exclude.length ? "repo root (filtered)" : "repo root"; }
+      else n.display = n.path || n.span.label;
+    } else n.display = n.span.label;
     n.w = n.kind === "op" ? GNODE_W : GLANE_W - 8;
   }
-  const groups = [...new Set(nodes.filter(n => n.kind === "op").map(n => n.group))].sort();
+  const groups = [...new Set(visible.filter(n => n.kind === "op").map(n => n.group))].sort();
 
-  // ---- layout: left lane (files, then cache) ----
-  const files = nodes.filter(n => n.kind === "file").sort((a, b) => (a.path || a.display).localeCompare(b.path || b.display));
-  const caches = nodes.filter(n => n.kind === "cache").sort((a, b) => a.display.localeCompare(b.display));
+  // ---- left lane: filesystem tree, then a cache-volume section ----
+  const root = { seg: "/", isDir: true, kids: new Map(), digestNodes: [], props: new Set() };
+  for (const fn of visible.filter(n => n.kind === "file")) gTreeInsert(root, fn);
+  const treeRows = [];
+  gTreeLayout(root, treeRows);
+  const laneRight = GPAD + GLANE_W;
   const sections = [];
   let ly = GTOP;
   sections.push({ label: "Files", x: GPAD, y: ly });
   ly += GSEC_HEAD;
-  for (const n of files) { n.x = GPAD; n.y = ly; ly += GROW; }
+  for (const row of treeRows) {
+    row.x = GPAD + row.depth * GINDENT;
+    row.y = ly;
+    row.w = laneRight - row.x;
+    for (const dn of row.digestNodes) dn.row = row;
+    ly += GROW;
+  }
+  const caches = visible.filter(n => n.kind === "cache").sort((a, b) => a.display.localeCompare(b.display));
   if (caches.length) {
     ly += GSEC_GAP;
     sections.push({ label: "Cache volumes", x: GPAD, y: ly });
     ly += GSEC_HEAD;
-    for (const n of caches) { n.x = GPAD; n.y = ly; ly += GROW; }
+    for (const n of caches) { n.x = GPAD; n.y = ly; n.w = GLANE_W - 8; ly += GROW; }
   }
   const laneBottom = ly;
 
-  // ---- layout: main area — ops ranked by op-only dependency depth, then laid
-  // out in one horizontal band per check/function group so groups never overlap.
-  const ops = nodes.filter(n => n.kind === "op");
+  // ---- main area — ops ranked by op-only dependency depth, one horizontal band
+  // per check/function group so groups never overlap.
+  const ops = visible.filter(n => n.kind === "op");
   const rank = new Map(), seen = new Set();
   const opRank = n => {
     if (rank.has(n)) return rank.get(n);
@@ -1136,7 +1222,7 @@ function buildGraph() {
   };
   ops.forEach(opRank);
   const maxCol = ops.reduce((m, n) => Math.max(m, rank.get(n)), 0);
-  const mainX0 = GPAD + GLANE_W + GLANE_GAP;
+  const mainX0 = laneRight + GLANE_GAP;
   const bandW = (maxCol + 1) * GCOL;
   const groupBoxes = [];
   let bandY = GTOP, mainBottom = GTOP;
@@ -1155,12 +1241,11 @@ function buildGraph() {
     }
     groupBoxes.push({ label: grp || "shared", x: mainX0 - 10, y: bandY - 22, w: bandW, h: bandBottom - bandY + 28 });
     mainBottom = bandBottom;
-    bandY = bandBottom + 46; // gap between group bands
+    bandY = bandBottom + 46;
   }
-  const mainRight = mainX0 + bandW;
   state.graph = {
-    nodes, edges, byDigest, groups, sections, groupBoxes,
-    width: Math.max(mainRight, GPAD + GLANE_W) + GPAD,
+    nodes: visible, edges, byDigest, groups, sections, groupBoxes, treeRows, laneRight,
+    width: Math.max(mainX0 + bandW, laneRight) + GPAD,
     height: Math.max(laneBottom, mainBottom) + GPAD,
   };
 }
@@ -1225,6 +1310,28 @@ function focusHighlight(group) {
   const seeds = state.graph.nodes.filter(n => n.kind === "op" && n.group === group);
   return graphClosure(seeds);
 }
+// Files that triggered the work Dagger actually ran: start from the executed
+// (non-cached) nodes and walk upstream, but only through other executed nodes —
+// stopping at cache hits, since a cached node's inputs didn't cause this run. The
+// host-file reads reached at that frontier are the triggers. `sources` = those
+// files; `related` = the whole executed chain. Approximate (a superset of the true
+// triggers: it can't tell which input of a multi-input node actually changed).
+function cacheTriggerHighlight() {
+  const g = state.graph;
+  const uncached = g.nodes.filter(n => n.kind !== "file" && !n.span.cached);
+  const related = new Set(uncached.map(n => n.digest));
+  const stack = [...uncached];
+  while (stack.length) {
+    const n = stack.pop();
+    for (const i of n.inputs) {
+      if (related.has(i.digest)) continue;
+      if (i.kind === "file" || !i.span.cached) { related.add(i.digest); stack.push(i); }
+    }
+  }
+  const sources = new Set();
+  for (const n of g.nodes) if (n.kind === "file" && related.has(n.digest)) sources.add(n.digest);
+  return { sources, related };
+}
 // The persistent (non-hover) highlight, by precedence: search box → file-impact →
 // check focus → none. Hover overlays this transiently.
 function baseHighlight() {
@@ -1233,6 +1340,7 @@ function baseHighlight() {
   if (q) return searchHighlight(q);
   if (state.impact) return state.impact;
   if (state.graphFocus) return focusHighlight(state.graphFocus);
+  if (state.graphCacheTrigger) return cacheTriggerHighlight();
   return null;
 }
 
@@ -1240,12 +1348,12 @@ function baseHighlight() {
 // for search/impact/focus changes so the graph stays smooth.
 function applyGraphHighlight(hl) {
   const host = document.getElementById("graph");
-  for (const el of host.querySelectorAll(".gnode")) {
+  for (const el of host.querySelectorAll(".gnode, .gtreerow")) {
     el.classList.remove("source", "hit", "dim");
     if (!hl) continue;
-    const dg = el.dataset.digest;
-    if (hl.sources.has(dg)) el.classList.add("source");
-    else if (hl.related.has(dg)) el.classList.add("hit");
+    const digs = el.dataset.digests ? el.dataset.digests.split(",") : [];
+    if (digs.some(d => hl.sources.has(d))) el.classList.add("source");
+    else if (digs.some(d => hl.related.has(d))) el.classList.add("hit");
     else el.classList.add("dim");
   }
   for (const el of host.querySelectorAll(".gedge")) {
@@ -1255,6 +1363,11 @@ function applyGraphHighlight(hl) {
     el.classList.toggle("dim", !!hl && !on);
   }
 }
+
+// Edge endpoints: op/cache nodes attach at their rect edges; file nodes attach at
+// their merged tree row (out on the right of the lane, in at the row's indented left).
+const gOut = n => n.kind === "file" && n.row ? { x: state.graph.laneRight, y: n.row.y + GNODE_H / 2 } : { x: n.x + n.w, y: n.y + GNODE_H / 2 };
+const gIn = n => n.kind === "file" && n.row ? { x: n.row.x, y: n.row.y + GNODE_H / 2 } : { x: n.x, y: n.y + GNODE_H / 2 };
 
 function renderGraph() {
   if (!state.graph) buildGraph();
@@ -1267,17 +1380,38 @@ function renderGraph() {
     parts.push(`<rect class="ggroup" x="${b.x}" y="${b.y}" width="${b.w}" height="${b.h}" rx="8"/>`);
     parts.push(`<text class="ggroup-label" x="${b.x + 8}" y="${b.y + 15}">${esc(b.label)}</text>`);
   }
-  // left-lane section frames + labels
+  // left-lane section labels
   for (const s of g.sections) parts.push(`<text class="glabel" x="${s.x}" y="${s.y + 12}">${esc(s.label)}</text>`);
   // edges
   parts.push(`<g class="gedges">`);
   for (const [a, b] of g.edges) {
-    const x1 = a.x + a.w, y1 = a.y + GNODE_H / 2, x2 = b.x, y2 = b.y + GNODE_H / 2, mx = (x1 + x2) / 2;
-    parts.push(`<path class="gedge" data-a="${a.digest}" data-b="${b.digest}" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`);
+    const p = gOut(a), q = gIn(b), mx = (p.x + q.x) / 2;
+    parts.push(`<path class="gedge" data-a="${a.digest}" data-b="${b.digest}" d="M${p.x},${p.y} C${mx},${p.y} ${mx},${q.y} ${q.x},${q.y}"/>`);
   }
   parts.push(`</g>`);
-  // nodes
+  // filesystem tree rows (files/folders, merged)
+  for (const row of g.treeRows) {
+    const dns = row.digestNodes;
+    const cls = ["gtreerow", row.isDir ? "dir" : "file"];
+    if (dns.some(d => d.span.statusCode === 2)) cls.push("err");
+    if (dns.length && dns.every(d => d.span.cached)) cls.push("cached");
+    if (dns.some(d => state.selected === d.span.id)) cls.push("sel");
+    const props = [...row.props];
+    const name = (row.depth === 0 ? "/" : row.seg) + (row.isDir && row.depth > 0 ? "/" : "");
+    const avail = row.w - 14 - (props.length ? props.join(" ").length * 5.5 + 10 : 0);
+    const max = Math.max(6, Math.floor(avail / 6.6));
+    const lbl = name.length > max ? "…" + name.slice(name.length - max + 1) : name;
+    parts.push(
+      `<g class="${cls.join(" ")}"${dns.length ? ` data-id="${dns[0].span.id}"` : ""} data-digests="${dns.map(d => d.digest).join(",")}" transform="translate(${row.x},${row.y})">` +
+      `<title>${esc(row.fullPath)}${props.length ? "\n· " + props.join(" · ") : ""}</title>` +
+      `<rect width="${row.w}" height="${GNODE_H}" rx="4"/>` +
+      `<text class="gtree-name" x="8" y="15">${esc(lbl)}</text>` +
+      (props.length ? `<text class="gprop" x="${row.w - 6}" y="15" text-anchor="end">${esc(props.join(" "))}</text>` : "") +
+      `</g>`);
+  }
+  // op + cache nodes
   for (const n of g.nodes) {
+    if (n.kind === "file") continue;
     const s = n.span;
     const cls = ["gnode", n.kind];
     if (s.statusCode === 2) cls.push("err");
@@ -1286,7 +1420,7 @@ function renderGraph() {
     const max = Math.floor((n.w - 12) / 6.6);
     const lbl = n.display.length > max ? n.display.slice(0, max - 1) + "…" : n.display;
     parts.push(
-      `<g class="${cls.join(" ")}" data-id="${s.id}" data-digest="${n.digest}" transform="translate(${n.x},${n.y})">` +
+      `<g class="${cls.join(" ")}" data-id="${s.id}" data-digests="${n.digest}" transform="translate(${n.x},${n.y})">` +
       `<title>${esc(n.display)}${n.display !== s.label ? " — " + esc(s.label) : ""}</title>` +
       `<rect width="${n.w}" height="${GNODE_H}" rx="4"/>` +
       `<text x="8" y="15">${esc(lbl)}</text></g>`);
@@ -1482,21 +1616,24 @@ document.getElementById("expandall").addEventListener("click", () => { for (cons
 document.getElementById("collapseall").addEventListener("click", () => { state.expanded.clear(); render(); });
 document.querySelectorAll(".viewswitch button").forEach(b => b.addEventListener("click", () => setGraphView(b.dataset.view === "graph")));
 document.getElementById("graph-focus").addEventListener("change", e => { state.graphFocus = e.target.value; applyGraphHighlight(baseHighlight()); });
+document.getElementById("graph-cache").addEventListener("change", e => { state.graphCacheTrigger = e.target.checked; applyGraphHighlight(baseHighlight()); });
+document.getElementById("graph-raw").addEventListener("change", e => { state.graphRaw = e.target.checked; state.graph = null; renderGraph(); populateFocus(); });
 document.getElementById("impact-path").addEventListener("input", applyImpact);
 document.getElementById("impact-clear").addEventListener("click", () => { document.getElementById("impact-path").value = ""; applyImpact(); });
 // Graph interactions via delegation (survive re-renders): click selects, hover
 // lights the node's connected subgraph, leaving restores the persistent highlight.
+const gNodes = digs => digs.split(",").map(d => state.graph.byDigest.get(d)).filter(Boolean);
 const graphEl = document.getElementById("graph");
-graphEl.addEventListener("click", e => { const n = e.target.closest(".gnode"); if (n) select(n.dataset.id); });
+graphEl.addEventListener("click", e => { const n = e.target.closest("[data-id]"); if (n) select(n.dataset.id); });
 graphEl.addEventListener("mouseover", e => {
-  const n = e.target.closest(".gnode");
+  const n = e.target.closest(".gnode, .gtreerow");
   if (!n || !state.graph) return;
-  const node = state.graph.byDigest.get(n.dataset.digest);
-  if (node) applyGraphHighlight(graphClosure([node]));
+  const seeds = gNodes(n.dataset.digests || "");
+  if (seeds.length) applyGraphHighlight(graphClosure(seeds));
 });
 graphEl.addEventListener("mouseout", e => {
-  const n = e.target.closest(".gnode");
-  const to = e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest(".gnode");
+  const n = e.target.closest(".gnode, .gtreerow");
+  const to = e.relatedTarget && e.relatedTarget.closest && e.relatedTarget.closest(".gnode, .gtreerow");
   if (n && !to) applyGraphHighlight(baseHighlight());
 });
 const dz = document.getElementById("dropzone");
