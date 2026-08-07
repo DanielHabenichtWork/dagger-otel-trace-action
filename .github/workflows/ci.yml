@@ -31,3 +31,4 @@ jobs:
         continue-on-error: true
         with:
           title: "biome check"
+          default-view: graph

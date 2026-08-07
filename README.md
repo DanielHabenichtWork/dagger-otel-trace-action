@@ -287,6 +287,7 @@ then drill in with `dagger-trace report --grep biome --full <capture-dir>`.
 |---|---|---|
 | `data-dir` | `$RUNNER_TEMP/dagger-otel` | must match `start` |
 | `title` | `dagger trace` | header shown in the viewer |
+| `default-view` | `timeline` | view the viewer opens in: `timeline` (waterfall) or `graph` (beta node-edge DAG); the toggle is always available |
 | `artifact-name` | `dagger-trace.html` | artifact + downloaded file name |
 | `retention-days` | `14` | artifact retention |
 | `comment` | `true` | upsert a PR comment (pull_request events only) |

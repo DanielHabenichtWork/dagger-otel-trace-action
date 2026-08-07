@@ -114,6 +114,29 @@
   #dropzone.hover { border-color: var(--accent); color: var(--accent); }
   #dropzone code { font-family: var(--mono); }
   #loaderr { color: var(--err); padding: 16px; font-family: var(--mono); white-space: pre-wrap; display: none; }
+
+  /* graph view (beta) */
+  #graph { flex: 1; overflow: auto; min-width: 0; position: relative; background: var(--bg); }
+  #graph[hidden] { display: none; }
+  #graph svg { display: block; }
+  .gedge { fill: none; stroke: var(--border); stroke-width: 1; }
+  .gedge.on { stroke: var(--accent); stroke-width: 1.6; }
+  .gedge.dim { opacity: .12; }
+  .gnode { cursor: pointer; }
+  .gnode rect { fill: var(--bg3); stroke: var(--border); stroke-width: 1; }
+  .gnode text { fill: var(--fg); font: 11px var(--mono); }
+  .gnode:hover rect { stroke: var(--accent); }
+  .gnode.err rect { stroke: var(--err); }
+  .gnode.err text { fill: var(--err); }
+  .gnode.cached rect { fill: #11151c; }
+  .gnode.cached text { fill: var(--fg-dim); }
+  .gnode.sel rect { stroke: var(--accent); stroke-width: 2; fill: #1f3a5f; }
+  .gnode.hit rect { stroke: var(--ok); stroke-width: 1.6; }
+  .gnode.source rect { stroke: var(--warn); stroke-width: 2; }
+  .gnode.hit text, .gnode.source text { fill: var(--fg); }
+  .gnode.dim { opacity: .26; }
+  #impact-wrap input { background: var(--bg3); color: var(--fg); border: 1px solid var(--border); border-radius: 6px; padding: 3px 8px; }
+  #impact-count { color: var(--fg-dim); font-size: 12px; margin-left: 8px; }
 </style>
 </head>
 <body>
@@ -135,6 +158,9 @@
   <label><input type="checkbox" id="f-cached" checked> cached spans</label>
   <button id="expandall">Expand all</button>
   <button id="collapseall">Collapse</button>
+  <span style="flex:1"></span>
+  <label title="Experimental node-edge DAG built from dag.digest / dag.inputs"><input type="checkbox" id="f-graph"> graph view <span style="opacity:.55">beta</span></label>
+  <span id="impact-wrap" hidden><input type="search" id="impact-path" placeholder="file path → highlight rebuilds" style="width:240px"><span id="impact-count"></span><button id="impact-clear" type="button" style="margin-left:8px">clear</button></span>
 </div>
 <div id="content">
   <div id="tree">
@@ -147,6 +173,7 @@
     </div>
     <div id="rows"></div>
   </div>
+  <div id="graph" hidden></div>
   <aside id="detail">
     <div class="dhead">
       <button class="close" id="dclose" title="Close">✕</button>
@@ -310,6 +337,10 @@ const state = {
   selected: null,
   expanded: new Set(),
   query: "",
+  view: "tree",   // "tree" | "graph"
+  graph: null,    // cached {nodes, edges, width, height} from buildGraph()
+  impact: null,   // Set(digest) of nodes a file change would rebuild, or null
+  defaultView: null, // meta.defaultView: open in "graph" when the producer opts in
 };
 
 function ingestTraces(batches) {
@@ -839,6 +870,7 @@ function select(id) {
   </table>`;
   body.appendChild(timing);
   render();
+  if (state.view === "graph") renderGraph();
 }
 
 /* ---------- summary ---------- */
@@ -953,6 +985,164 @@ function renderSummary() {
   }));
 }
 
+/* ---------- graph view (beta) ----------
+   The real Dagger DAG: one node per dag.digest, edges from dag.inputs (each
+   input digest -> the node that consumes it). This is the data-dependency graph,
+   distinct from the parent/child span tree the waterfall renders. Off by default
+   (the "graph view" toolbar toggle). File-impact ("if I change this file, which
+   jobs rebuild?") seeds from Host.directory reads whose include/exclude globs
+   match the file, then follows edges downstream. Granularity is whole
+   content-addressed directory reads, so it over-approximates: it can't know a
+   changed file is semantically a no-op, only that it feeds these nodes. */
+const GNODE_W = 210, GNODE_H = 22, GCOL = 250, GROW = 30, GPAD = 24;
+
+function buildGraph() {
+  // One node per digest; prefer a span that carries a decoded call over a bare
+  // pending/effect span so the label + args are populated.
+  const byDigest = new Map();
+  for (const s of state.spans.values()) {
+    const dg = s.attrs["dagger.io/dag.digest"];
+    if (!dg) continue;
+    const prev = byDigest.get(dg);
+    if (!prev || (!prev.span.call && s.call)) byDigest.set(dg, { digest: dg, span: s, inputs: [], outputs: [] });
+  }
+  const nodes = [...byDigest.values()];
+  const edges = [];
+  for (const n of nodes) {
+    const ins = n.span.attrs["dagger.io/dag.inputs"];
+    if (!Array.isArray(ins)) continue;
+    for (const dg of ins) {
+      const src = byDigest.get(dg);
+      if (src && src !== n) { n.inputs.push(src); src.outputs.push(n); edges.push([src, n]); }
+    }
+  }
+  // Longest-path layering (rank = max input rank + 1) → left-to-right columns.
+  const rank = new Map(), seen = new Set();
+  const rankOf = n => {
+    if (rank.has(n)) return rank.get(n);
+    if (seen.has(n)) return 0; // cycle guard (a DAG shouldn't hit this)
+    seen.add(n);
+    let r = 0;
+    for (const i of n.inputs) r = Math.max(r, rankOf(i) + 1);
+    seen.delete(n);
+    rank.set(n, r);
+    return r;
+  };
+  nodes.forEach(rankOf);
+  const layers = [];
+  for (const n of nodes) (layers[rank.get(n)] || (layers[rank.get(n)] = [])).push(n);
+  let maxRows = 0;
+  layers.forEach((layer, col) => {
+    layer.sort((a, b) => a.span.start - b.span.start || a.span.label.localeCompare(b.span.label));
+    layer.forEach((n, row) => { n.x = GPAD + col * GCOL; n.y = GPAD + row * GROW; });
+    maxRows = Math.max(maxRows, layer.length);
+  });
+  state.graph = {
+    nodes, edges,
+    width: GPAD * 2 + Math.max(1, layers.length) * GCOL,
+    height: GPAD * 2 + Math.max(1, maxRows) * GROW,
+  };
+}
+
+// Dagger-style relative glob → RegExp. A bare name (e.g. ".dagger") also matches
+// everything under it. Best-effort: ** / * / ? only.
+function globToRe(glob) {
+  let re = "";
+  const g = String(glob).replace(/^\.?\//, "");
+  for (let i = 0; i < g.length; i++) {
+    const c = g[i];
+    if (c === "*") { if (g[i + 1] === "*") { re += ".*"; i++; if (g[i + 1] === "/") i++; } else re += "[^/]*"; }
+    else if (c === "?") re += "[^/]";
+    else re += c.replace(/[.+^${}()|[\]\\]/g, "\\$&");
+  }
+  return new RegExp("^" + re + "(/.*)?$");
+}
+// The host-file spec behind a Host.directory / Host.file read: the include /
+// exclude globs that decide which host files feed this node. The path arg is the
+// repo root in practice, so matching is done relative to the root.
+function hostSpec(node) {
+  if (!/^Host\.(directory|file)\b/.test(node.span.name) || !node.span.call) return null;
+  const by = {};
+  for (const a of node.span.call.args) by[a.name] = a.value;
+  const arr = v => v == null ? [] : Array.isArray(v) ? v.map(String) : [String(v)];
+  return { include: arr(by.include), exclude: arr(by.exclude) };
+}
+function hostMatches(spec, file) {
+  const f = file.replace(/^\.?\//, "");
+  if (spec.exclude.some(g => globToRe(g).test(f))) return false;
+  if (spec.include.length && !spec.include.some(g => globToRe(g).test(f))) return false;
+  return true;
+}
+// Digests whose result a change to `file` would invalidate: the Host reads it
+// matches, plus everything reachable downstream through edges.
+function computeImpact(file) {
+  if (!state.graph) buildGraph();
+  const impacted = new Set(), sources = new Set(), queue = [];
+  for (const n of state.graph.nodes) {
+    const spec = hostSpec(n);
+    if (spec && hostMatches(spec, file)) { impacted.add(n.digest); sources.add(n.digest); queue.push(n); }
+  }
+  while (queue.length) {
+    const n = queue.shift();
+    for (const out of n.outputs) if (!impacted.has(out.digest)) { impacted.add(out.digest); queue.push(out); }
+  }
+  return { impacted, sources };
+}
+
+function renderGraph() {
+  if (!state.graph) buildGraph();
+  const g = state.graph;
+  const host = document.getElementById("graph");
+  const sx = host.scrollLeft, sy = host.scrollTop;
+  const imp = state.impact;
+  const parts = [`<svg width="${g.width}" height="${g.height}" viewBox="0 0 ${g.width} ${g.height}"><g class="gedges">`];
+  for (const [a, b] of g.edges) {
+    const x1 = a.x + GNODE_W, y1 = a.y + GNODE_H / 2, x2 = b.x, y2 = b.y + GNODE_H / 2, mx = (x1 + x2) / 2;
+    const on = imp && imp.impacted.has(a.digest) && imp.impacted.has(b.digest);
+    const dim = imp && !on;
+    parts.push(`<path class="gedge${on ? " on" : ""}${dim ? " dim" : ""}" d="M${x1},${y1} C${mx},${y1} ${mx},${y2} ${x2},${y2}"/>`);
+  }
+  parts.push(`</g>`);
+  for (const n of g.nodes) {
+    const s = n.span;
+    const cls = ["gnode"];
+    if (s.statusCode === 2) cls.push("err");
+    if (s.cached) cls.push("cached");
+    if (state.selected === s.id) cls.push("sel");
+    if (imp) {
+      if (imp.sources.has(n.digest)) cls.push("source");
+      else if (imp.impacted.has(n.digest)) cls.push("hit");
+      else cls.push("dim");
+    }
+    const lbl = s.label.length > 30 ? s.label.slice(0, 29) + "…" : s.label;
+    parts.push(
+      `<g class="${cls.join(" ")}" data-id="${s.id}" transform="translate(${n.x},${n.y})">` +
+      `<title>${esc(s.label)}</title>` +
+      `<rect width="${GNODE_W}" height="${GNODE_H}" rx="4"/>` +
+      `<text x="8" y="15">${esc(lbl)}</text></g>`);
+  }
+  parts.push(`</svg>`);
+  host.innerHTML = parts.join("");
+  host.scrollLeft = sx; host.scrollTop = sy;
+  host.querySelectorAll(".gnode").forEach(el => el.addEventListener("click", () => select(el.dataset.id)));
+}
+
+function setGraphView(on) {
+  state.view = on ? "graph" : "tree";
+  document.getElementById("tree").style.display = on ? "none" : "";
+  document.getElementById("graph").hidden = !on;
+  document.getElementById("impact-wrap").hidden = !on;
+  if (on) renderGraph();
+}
+function applyImpact() {
+  const input = document.getElementById("impact-path");
+  const v = input.value.trim();
+  state.impact = v ? computeImpact(v) : null;
+  document.getElementById("impact-count").textContent =
+    state.impact ? `${state.impact.impacted.size} of ${state.graph.nodes.length} nodes rebuild` : "";
+  renderGraph();
+}
+
 /* ---------- boot ---------- */
 function autoDetectIngest(batches) {
   ingestTraces(batches.filter(b => b.resourceSpans));
@@ -961,6 +1151,7 @@ function autoDetectIngest(batches) {
 }
 function finishLoad() {
   buildTree();
+  state.graph = null; state.impact = null; // rebuilt lazily from the fresh model
   document.getElementById("dropzone").style.display = "none";
   document.getElementById("toolbar").hidden = false;
   // expand the interesting first levels by default
@@ -971,6 +1162,12 @@ function finishLoad() {
   }
   renderSummary();
   render();
+  // Producer opt-in (finish action's default-view: graph): open in the graph
+  // view, with the toggle still available to switch back.
+  if (state.defaultView === "graph") {
+    document.getElementById("f-graph").checked = true;
+    setGraphView(true);
+  }
 }
 function loadError(e) {
   const el = document.getElementById("loaderr");
@@ -1016,6 +1213,7 @@ function metaHtml(m) {
 function applyMeta(m) {
   document.title = `Dagger trace — ${m.title || ""}`;
   document.getElementById("meta").innerHTML = metaHtml(m);
+  if (m.defaultView) state.defaultView = m.defaultView;
 }
 function ingestBatches(batches) {
   for (const b of batches) if (b.__meta__) applyMeta(b.__meta__);
@@ -1093,6 +1291,9 @@ document.getElementById("search").addEventListener("input", e => { state.query =
 for (const id of ["f-internal", "f-encapsulated", "f-cached"]) document.getElementById(id).addEventListener("change", render);
 document.getElementById("expandall").addEventListener("click", () => { for (const id of state.spans.keys()) state.expanded.add(id); render(); });
 document.getElementById("collapseall").addEventListener("click", () => { state.expanded.clear(); render(); });
+document.getElementById("f-graph").addEventListener("change", e => setGraphView(e.target.checked));
+document.getElementById("impact-path").addEventListener("input", applyImpact);
+document.getElementById("impact-clear").addEventListener("click", () => { document.getElementById("impact-path").value = ""; applyImpact(); });
 const dz = document.getElementById("dropzone");
 dz.addEventListener("dragover", e => { e.preventDefault(); dz.classList.add("hover"); });
 dz.addEventListener("dragleave", () => dz.classList.remove("hover"));

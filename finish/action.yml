@@ -15,6 +15,10 @@ inputs:
     description: "Title shown in the viewer header."
     required: false
     default: "dagger trace"
+  default-view:
+    description: "Which view the viewer opens in: 'timeline' (waterfall, default) or 'graph' (beta node-edge DAG). The graph toggle is always available regardless."
+    required: false
+    default: "timeline"
   artifact-name:
     description: "Artifact name and downloaded file name (should end in .html)."
     required: false
@@ -54,6 +58,7 @@ runs:
           --arg sha "$GITHUB_SHA" \
           --arg date "$(date -u +%FT%TZ)" \
           --arg runUrl "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+          --arg defaultView "${{ inputs.default-view }}" \
           '$ARGS.named' > "$data_dir/meta.json"
         "$GITHUB_ACTION_PATH/../scripts/finish.sh" "$data_dir" "$out" "$data_dir/meta.json"
         echo "output=$out" >> "$GITHUB_OUTPUT"
