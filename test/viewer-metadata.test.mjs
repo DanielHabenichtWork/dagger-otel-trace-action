@@ -29,8 +29,8 @@ test("repository, branch, and commit metadata render as links", () => {
   const end = viewer.indexOf("function applyMeta", start);
   assert.ok(start >= 0 && end > start, "could not locate metadata helpers in viewer.html");
   const helpers = viewer.slice(start, end);
-  const metaHtml = new Function(
-    `const esc = s => s.replace(/[&<>\"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '\"': "&quot;" }[c]));\n${helpers}\nreturn metaHtml;`,
+  const { metaHtml, viewerReleaseUrl } = new Function(
+    `const esc = s => s.replace(/[&<>\"]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '\"': "&quot;" }[c]));\n${helpers}\nreturn { metaHtml, viewerReleaseUrl };`,
   )();
 
   const html = metaHtml({
@@ -39,9 +39,18 @@ test("repository, branch, and commit metadata render as links", () => {
     ref: "feature/new-ui",
     sha: "0123456789abcdef",
     runUrl: "https://github.com/acme/widgets/actions/runs/42",
+    date: "2026-08-07T12:00:00Z",
   });
 
   assert.match(html, /href="https:\/\/github\.com\/acme\/widgets">acme\/widgets<\/a>/);
   assert.match(html, /href="https:\/\/github\.com\/acme\/widgets\/tree\/feature\/new-ui">feature\/new-ui<\/a>/);
   assert.match(html, /href="https:\/\/github\.com\/acme\/widgets\/commit\/0123456789abcdef">0123456789<\/a>/);
+  assert.ok(html.indexOf("acme/widgets") < html.indexOf("feature/new-ui"));
+  assert.ok(html.indexOf("feature/new-ui") < html.indexOf("0123456789"));
+  assert.ok(html.indexOf("0123456789") < html.indexOf("workflow run"));
+  assert.ok(html.indexOf("workflow run") < html.indexOf("2026-08-07T12:00:00Z"));
+  assert.equal(
+    viewerReleaseUrl("https://github.com/DanielHabenichtWork/dagger-otel-trace-action", "1.8.0"),
+    "https://github.com/DanielHabenichtWork/dagger-otel-trace-action/releases/tag/v1.8.0",
+  );
 });

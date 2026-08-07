@@ -18,6 +18,7 @@
   header h1 { font-size: 15px; margin: 0; }
   header .meta { color: var(--fg-dim); font-size: 12px; }
   header .meta a { color: var(--accent); text-decoration: none; }
+  header .viewer-meta { margin-left: auto; }
 
   #summary { padding: 8px 16px; border-bottom: 1px solid var(--border); background: var(--bg2); display: flex; flex-wrap: wrap; gap: 6px 14px; font-size: 12px; }
   .chip { border: 1px solid var(--border); border-radius: 12px; padding: 1px 10px; cursor: pointer; background: var(--bg3); }
@@ -118,8 +119,8 @@
 <body>
 <header>
   <h1>Dagger trace</h1>
-  <span class="meta"><a id="viewer-source" href="https://github.com/DanielHabenichtWork/dagger-otel-trace-action">GitHub</a></span>
   <span class="meta" id="meta"></span>
+  <span class="meta viewer-meta"><a id="viewer-source" href="https://github.com/DanielHabenichtWork/dagger-otel-trace-action">GitHub</a></span>
 </header>
 <div id="summary" hidden></div>
 <div id="usage-popup" role="dialog" aria-modal="false" aria-labelledby="usage-title" hidden>
@@ -992,6 +993,9 @@ function metaLink(label, url) {
   const safe = safeHttpUrl(url);
   return safe ? `<a href="${esc(safe)}">${esc(String(label))}</a>` : esc(String(label));
 }
+function viewerReleaseUrl(repoUrl, version) {
+  return `${safeHttpUrl(repoUrl).replace(/\/$/, "")}/releases/tag/${encodeURIComponent(`v${version}`)}`;
+}
 function metaHtml(m) {
   let repoUrl = safeHttpUrl(m.repoUrl);
   if (!repoUrl && m.repo && String(m.repo).includes("/")) {
@@ -1005,8 +1009,8 @@ function metaHtml(m) {
   if (m.repo) parts.push(metaLink(m.repo, repoUrl));
   if (m.ref) parts.push(metaLink(m.ref, repoUrl && `${repoUrl}/tree/${pathPart(m.ref)}`));
   if (m.sha) parts.push(metaLink(String(m.sha).slice(0, 10), repoUrl && `${repoUrl}/commit/${encodeURIComponent(m.sha)}`));
-  if (m.date) parts.push(esc(String(m.date)));
   if (m.runUrl) parts.push(metaLink("workflow run", m.runUrl));
+  if (m.date) parts.push(esc(String(m.date)));
   return parts.join(" · ");
 }
 function applyMeta(m) {
@@ -1019,7 +1023,12 @@ function ingestBatches(batches) {
 }
 async function loadEmbedded() {
   const versionEl = document.getElementById("data-viewer-version");
-  if (versionEl) document.getElementById("viewer-source").textContent = `v${versionEl.textContent.trim()} · GitHub`;
+  if (versionEl) {
+    const version = versionEl.textContent.trim();
+    const source = document.getElementById("viewer-source");
+    source.textContent = `viewer v${version}`;
+    source.href = viewerReleaseUrl(source.href, version);
+  }
   const metaEl = document.getElementById("data-meta");
   if (metaEl) {
     try { applyMeta(JSON.parse(metaEl.textContent)); } catch (e) { /* meta is optional */ }
